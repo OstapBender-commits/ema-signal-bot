@@ -1,6 +1,7 @@
 import requests
 import time
 import os
+import statistics
 from datetime import datetime, UTC
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -10,7 +11,7 @@ CHAT_ID = os.environ.get("CHAT_ID")
 
 PORT = int(os.environ.get("PORT", 10000))
 
-# ===== WEB SERVER FOR RENDER =====
+# ===== WEB SERVER =====
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -19,7 +20,6 @@ class Handler(BaseHTTPRequestHandler):
 
 def run_server():
     server = HTTPServer(("0.0.0.0", PORT), Handler)
-    print("HTTP server started")
     server.serve_forever()
 
 # ===== TELEGRAM =====
@@ -27,130 +27,116 @@ def send(msg):
     try:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
-    except Exception as e:
-        print("Telegram error:", e)
+    except:
+        pass
 
-# ==========================================================
-# 1. BYBIT
-# ==========================================================
-def test_bybit():
+# ===== SOURCES =====
+def get_gecko():
     try:
-        t0 = time.time()
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "bitcoin", "vs_currencies": "usd"},
+            timeout=5
+        ).json()
+        return float(r["bitcoin"]["usd"])
+    except:
+        return None
 
-        url = "https://api.bybit.com/v5/market/tickers"
-        r = requests.get(url, params={"category": "linear"}, timeout=10).json()
 
-        dt = round(time.time() - t0, 2)
-
-        if "result" not in r:
-            return f"❌ BYBIT: bad format {str(r)[:100]}"
-
-        btc = None
-        for x in r["result"]["list"]:
-            if x["symbol"] == "BTCUSDT":
-                btc = x
-                break
-
-        if not btc:
-            return "❌ BYBIT: BTCUSDT not found"
-
-        return f"""✅ BYBIT OK ({dt}s)
-price: {btc['lastPrice']}
-bid: {btc['bid1Price']}
-ask: {btc['ask1Price']}"""
-
-    except Exception as e:
-        return f"❌ BYBIT ERROR: {e}"
-
-# ==========================================================
-# 2. BINANCE
-# ==========================================================
-def test_binance():
+def get_cc():
     try:
-        t0 = time.time()
+        r = requests.get(
+            "https://min-api.cryptocompare.com/data/price",
+            params={"fsym": "BTC", "tsyms": "USDT"},
+            timeout=5
+        ).json()
+        return float(r["USDT"])
+    except:
+        return None
 
-        url = "https://api.binance.com/api/v3/ticker/price"
-        r = requests.get(url, params={"symbol": "BTCUSDT"}, timeout=10).json()
 
-        dt = round(time.time() - t0, 2)
+# ===== TEST ENGINE =====
+def run_test(minutes=30):
+    send("🧪 START SOURCE COMPARISON (30 min)")
 
-        if "price" not in r:
-            return f"❌ BINANCE: {str(r)[:100]}"
+    gecko = []
+    cc = []
 
-        return f"""✅ BINANCE OK ({dt}s)
-price: {r['price']}"""
+    last_g = None
+    last_c = None
 
-    except Exception as e:
-        return f"❌ BINANCE ERROR: {e}"
+    frozen_g = 0
+    frozen_c = 0
 
-# ==========================================================
-# 3. CRYPTOCOMPARE
-# ==========================================================
-def test_cryptocompare():
-    try:
-        t0 = time.time()
+    errors_g = 0
+    errors_c = 0
 
-        url = "https://min-api.cryptocompare.com/data/price"
-        r = requests.get(url, params={"fsym": "BTC", "tsyms": "USDT"}, timeout=10).json()
+    start = time.time()
 
-        dt = round(time.time() - t0, 2)
+    while time.time() - start < minutes * 60:
+        g = get_gecko()
+        c = get_cc()
 
-        if "USDT" not in r:
-            return f"❌ CRYPTOCOMPARE: {str(r)[:100]}"
+        # ---- CoinGecko ----
+        if g is None:
+            errors_g += 1
+        else:
+            gecko.append(g)
+            if g == last_g:
+                frozen_g += 1
+            last_g = g
 
-        return f"""✅ CRYPTOCOMPARE OK ({dt}s)
-price: {r['USDT']}"""
+        # ---- CryptoCompare ----
+        if c is None:
+            errors_c += 1
+        else:
+            cc.append(c)
+            if c == last_c:
+                frozen_c += 1
+            last_c = c
 
-    except Exception as e:
-        return f"❌ CRYPTOCOMPARE ERROR: {e}"
+        time.sleep(10)
 
-# ==========================================================
-# 4. COINGECKO
-# ==========================================================
-def test_coingecko():
-    try:
-        t0 = time.time()
+    # ===== METRICS =====
+    def stats(arr):
+        if len(arr) < 2:
+            return "no data"
+        return {
+            "updates": len(arr),
+            "std": round(statistics.stdev(arr), 2),
+            "range": round(max(arr) - min(arr), 2)
+        }
 
-        url = "https://api.coingecko.com/api/v3/simple/price"
-        r = requests.get(url, params={"ids": "bitcoin", "vs_currencies": "usd"}, timeout=10).json()
+    diff = []
+    for i in range(min(len(gecko), len(cc))):
+        diff.append(abs(gecko[i] - cc[i]))
 
-        dt = round(time.time() - t0, 2)
+    report = f"""
+📊 COMPARISON RESULT
 
-        if "bitcoin" not in r:
-            return f"❌ COINGECKO: {str(r)[:100]}"
+--- CoinGecko ---
+samples: {len(gecko)}
+frozen ticks: {frozen_g}
+errors: {errors_g}
+stats: {stats(gecko)}
 
-        return f"""✅ COINGECKO OK ({dt}s)
-price: {r['bitcoin']['usd']}"""
+--- CryptoCompare ---
+samples: {len(cc)}
+frozen ticks: {frozen_c}
+errors: {errors_c}
+stats: {stats(cc)}
 
-    except Exception as e:
-        return f"❌ COINGECKO ERROR: {e}"
+--- Divergence ---
+avg diff: {round(sum(diff)/len(diff),2) if diff else 'n/a'}
+max diff: {round(max(diff),2) if diff else 'n/a'}
 
-# ==========================================================
-# MAIN TEST
-# ==========================================================
-def full_test():
-    send("🔎 START MARKET DATA TEST")
+Time: {datetime.now(UTC)}
+"""
 
-    report = []
+    send(report)
 
-    report.append(test_bybit())
-    report.append(test_binance())
-    report.append(test_cryptocompare())
-    report.append(test_coingecko())
 
-    text = "📊 DATA SOURCE CHECK\n\n" + "\n\n".join(report)
-
-    text += f"\n\nTime: {datetime.now(UTC)}"
-
-    send(text)
-
-# ==========================================================
-# START
-# ==========================================================
+# ===== START =====
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
-
-    # запускаем тест каждые 5 минут
-    while True:
-        full_test()
-        time.sleep(300)
+    run_test(30)
