@@ -3,19 +3,43 @@ import time
 import os
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, UTC
+import threading
 
+# --- маленький веб-сервер ---
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+PORT = int(os.environ.get("PORT", 10000))
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+def run_server():
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    print("HTTP server started on port", PORT)
+    server.serve_forever()
+
+# --- настройки ---
 TOKEN = os.environ.get("TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-RISK = 2.5
-MAX_PER_DAY = 3
-REQUEST_DELAY = 1.2
+EMA_PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+RISK_EMA = 2.5      # 0.5%
+RISK_PUMP = 1.5     # 0.3%
+
+MAX_EMA = 3
+MAX_PUMP = 3
+
+REQUEST_DELAY = 1.0
 
 stats = {
     "day": "",
-    "count": 0,
+    "ema": 0,
+    "pump": 0,
     "log": []
 }
 
@@ -25,45 +49,45 @@ def send(msg):
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
     except Exception as e:
-        print("Telegram send error:", e)
+        print("Telegram error:", e)
 
-# ---------- Bybit candles ----------
-def klines(pair):
-    # Bybit требует формат BTCUSDT -> BTCUSDT (ок, совпадает)
+# ---------- BYBIT ----------
+def get_all_futures():
+    try:
+        url = "https://api.bybit.com/v5/market/tickers?category=linear"
+        r = requests.get(url, timeout=10).json()
+        return [x["symbol"] for x in r["result"]["list"] if x["symbol"].endswith("USDT")]
+    except:
+        return []
+
+def klines(pair, interval="15", limit=120):
     url = "https://api.bybit.com/v5/market/kline"
-
     params = {
         "category": "linear",
         "symbol": pair,
-        "interval": "15",
-        "limit": 120
+        "interval": interval,
+        "limit": limit
     }
 
     try:
         r = requests.get(url, params=params, timeout=10).json()
 
         if r.get("retCode") != 0:
-            print("Bybit error:", r)
-            time.sleep(5)
             return None
 
-        rows = r["result"]["list"]
-
-        # Bybit отдаёт в обратном порядке → разворачиваем
-        rows = rows[::-1]
+        rows = r["result"]["list"][::-1]
 
         closes = [float(x[4]) for x in rows]
+        highs  = [float(x[2]) for x in rows]
+        lows   = [float(x[3]) for x in rows]
+        vol    = [float(x[5]) for x in rows]
 
-        df = pd.DataFrame({"c": closes})
+        return pd.DataFrame({"c": closes, "h": highs, "l": lows, "v": vol})
 
-        return df
-
-    except Exception as e:
-        print("Klines exception:", e)
-        time.sleep(5)
+    except:
         return None
 
-# ---------- Индикаторы ----------
+# ---------- индикаторы ----------
 def ema(s, p):
     return s.ewm(span=p).mean()
 
@@ -74,109 +98,133 @@ def rsi(s, p=14):
     rs = g.rolling(p).mean() / l.rolling(p).mean()
     return 100 - 100 / (1 + rs)
 
-# ---------- Уровни ----------
-def calc_levels(price, side):
-    if side == "LONG":
-        stop = price * 0.994
-        tp1 = price * 1.012
-        tp2 = price * 1.024
-    else:
-        stop = price * 1.006
-        tp1 = price * 0.988
-        tp2 = price * 0.976
+# ---------- EMA ----------
+def check_ema(pair):
+    if stats["ema"] >= MAX_EMA:
+        return
 
-    return round(stop, 2), round(tp1, 2), round(tp2, 2)
+    df = klines(pair)
+    if df is None:
+        return
 
-# ---------- Отчёт ----------
-def daily_report():
-    if not stats["log"]:
-        return "📊 За вчера сигналов не было."
+    c = df["c"]
+    e50 = ema(c, 50)
+    e200 = ema(c, 200)
+    r = rsi(c)
 
-    text = "📊 Отчёт за день\n\n"
-    for l in stats["log"]:
-        text += f"{l}\n"
+    price = c.iloc[-1]
 
-    text += f"\nВсего сигналов: {stats['count']}"
-    return text
+    trend_up = price > e50.iloc[-1] and price > e200.iloc[-1]
+    trend_dn = price < e50.iloc[-1] and price < e200.iloc[-1]
 
-# ---------- СТАРТ ----------
-send("🟡 EMA Signal Bot STARTED (Bybit data)")
+    in_zone = 40 < r.iloc[-1] < 60
+    touch = abs(price - e50.iloc[-1]) / price < 0.0015
 
-# ---------- ОСНОВНОЙ ЦИКЛ ----------
-while True:
-    now = datetime.utcnow()
-    today = now.strftime("%Y-%m-%d")
+    if in_zone and touch:
+        side = "LONG" if trend_up else "SHORT" if trend_dn else None
+        if not side:
+            return
 
-    if stats["day"] != today:
-        if stats["day"] != "":
-            send(daily_report())
+        pos = round(RISK_EMA / 0.006, 1)
 
-        stats = {"day": today, "count": 0, "log": []}
-
-    for p in PAIRS:
-
-        if stats["count"] >= MAX_PER_DAY:
-            continue
-
-        df = klines(p)
-        if df is None:
-            continue
-
-        c = df["c"]
-
-        e50 = ema(c, 50)
-        e200 = ema(c, 200)
-        r = rsi(c)
-
-        price = c.iloc[-1]
-
-        trend_up = price > e50.iloc[-1] and price > e200.iloc[-1]
-        trend_dn = price < e50.iloc[-1] and price < e200.iloc[-1]
-
-        in_zone = 40 < r.iloc[-1] < 60
-        touch = abs(price - e50.iloc[-1]) / price < 0.0015
-
-        if in_zone and touch:
-
-            side = None
-            if trend_up:
-                side = "LONG"
-            elif trend_dn:
-                side = "SHORT"
-
-            if not side:
-                continue
-
-            stop, tp1, tp2 = calc_levels(price, side)
-            pos = round(RISK / 0.006, 1)
-
-            msg = f"""{'🟢' if side=='LONG' else '🔴'} {p} {side}
+        msg = f"""{'🟢' if side=='LONG' else '🔴'} EMA {pair} {side}
 Цена: {price}
 RSI: {round(r.iloc[-1],1)}
 
-Риск: {RISK}$
+Риск: {RISK_EMA}$
 Позиция: {pos}$
 
-Рекомендации:
+Сегодня EMA: {stats['ema']+1}/{MAX_EMA}"""
+
+        send(msg)
+        stats["ema"] += 1
+
+# ---------- PUMP ----------
+def check_pump(pair):
+    if stats["pump"] >= MAX_PUMP:
+        return
+
+    df = klines(pair, "5", 200)
+    if df is None:
+        return
+
+    c = df["c"]
+    v = df["v"]
+
+    growth15 = (c.iloc[-1] - c.iloc[-4]) / c.iloc[-4] * 100
+    growth60 = (c.iloc[-1] - c.iloc[-13]) / c.iloc[-13] * 100
+
+    vol_x = v.iloc[-1] / (v.mean() + 0.0001)
+
+    if not (growth15 > 10 and growth60 > 15 and vol_x > 3):
+        return
+
+    last = c.iloc[-1]
+    high = c.iloc[-20:].max()
+
+    drawdown = (high - last) / high * 100
+    r = rsi(c)
+
+    safe = drawdown > 3 and r.iloc[-1] < 75
+
+    if not safe:
+        return
+
+    stop = round(high * 1.02, 6)
+    tp1 = round(last * 0.96, 6)
+    tp2 = round(last * 0.93, 6)
+
+    pos = round(RISK_PUMP / 0.01, 1)
+
+    msg = f"""🚨 PUMP SHORT — {pair}
+
+Импульс 15m: +{round(growth15,1)}%
+Импульс 1h: +{round(growth60,1)}%
+Объём: x{round(vol_x,1)}
+
+Вход: {last}
 Стоп: {stop}
-Тейк1: {tp1}
-Тейк2: {tp2}
 
-Сегодня сигналов: {stats['count']+1}/{MAX_PER_DAY}
+Тейки:
+TP1: {tp1}
+TP2: {tp2}
 
-Проверь вручную:
-• EMA50/200
-• откат к EMA50
-• цвет свечи"""
+Риск: {RISK_PUMP}$
 
-            send(msg)
+Сегодня пампов: {stats['pump']+1}/{MAX_PUMP}"""
 
-            stats["count"] += 1
-            stats["log"].append(f"{p} {side} @ {price}")
+    send(msg)
+    stats["pump"] += 1
 
-            if stats["count"] >= MAX_PER_DAY:
-                send("⛔ Дневной лимит 3 сигнала достигнут. Ждём завтра.")
+# ---------- MAIN LOGIC ----------
+def bot_loop():
+    send("🟡 BOT STARTED (WEB MODE)")
 
-        time.sleep(REQUEST_DELAY)
+    while True:
+        now = datetime.now(UTC)
+        today = now.strftime("%Y-%m-%d")
 
-    time.sleep(30)
+        if stats["day"] != today:
+            stats["day"] = today
+            stats["ema"] = 0
+            stats["pump"] = 0
+
+        # EMA
+        for p in EMA_PAIRS:
+            check_ema(p)
+            time.sleep(REQUEST_DELAY)
+
+        # PUMPS
+        for p in get_all_futures():
+            check_pump(p)
+            time.sleep(REQUEST_DELAY)
+
+        time.sleep(30)
+
+# ---------- START ----------
+if __name__ == "__main__":
+    # веб-сервер в отдельном потоке
+    threading.Thread(target=run_server, daemon=True).start()
+
+    # основная логика
+    bot_loop()
