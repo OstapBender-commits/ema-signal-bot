@@ -46,13 +46,17 @@ def klines(pair, interval="15", limit=200):
     }
 
     try:
-        r = requests.get(url, params=params, timeout=10).json()
+        r = requests.get(url, params=params, timeout=10)
+        print("HTTP status:", r.status_code)
 
-        if r.get("retCode") != 0:
-            print("kline error", r)
+        data = r.json()
+        print("Bybit answer:", str(data)[:200])
+
+        if data.get("retCode") != 0:
+            print("kline error", data)
             return None
 
-        rows = r["result"]["list"][::-1]
+        rows = data["result"]["list"][::-1]
 
         closes = [float(x[4]) for x in rows]
 
@@ -61,7 +65,6 @@ def klines(pair, interval="15", limit=200):
     except Exception as e:
         print("kline exception", e)
         return None
-
 
 def ema(s, p):
     return s.ewm(span=p).mean()
