@@ -1,15 +1,16 @@
 import requests
 import time
 import os
-import pandas as pd
-import numpy as np
 from datetime import datetime, UTC
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# ================= WEB SERVER FOR RENDER =================
+TOKEN = os.environ.get("TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
+
 PORT = int(os.environ.get("PORT", 10000))
 
+# ===== WEB SERVER FOR RENDER =====
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -18,24 +19,10 @@ class Handler(BaseHTTPRequestHandler):
 
 def run_server():
     server = HTTPServer(("0.0.0.0", PORT), Handler)
-    print("HTTP server started on port", PORT)
+    print("HTTP server started")
     server.serve_forever()
 
-# ================= SETTINGS =================
-TOKEN = os.environ.get("TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-
-RISK_EMA = 2.5
-RISK_PUMP = 1.5
-
-MAX_EMA = 3
-MAX_PUMP = 3
-
-REQUEST_DELAY = 1.0
-
-stats = {"day": "", "ema": 0, "pump": 0}
-
-# ================= TELEGRAM =================
+# ===== TELEGRAM =====
 def send(msg):
     try:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -43,196 +30,127 @@ def send(msg):
     except Exception as e:
         print("Telegram error:", e)
 
-# ================= DATA SOURCE (аналитические) =================
-def klines(limit=2000):
-    """Данные только из нейтрального источника"""
+# ==========================================================
+# 1. BYBIT
+# ==========================================================
+def test_bybit():
     try:
-        url = "https://min-api.cryptocompare.com/data/v2/histominute"
-        params = {"fsym": "BTC", "tsym": "USDT", "limit": limit, "aggregate": 15}
+        t0 = time.time()
 
-        r = requests.get(url, params=params, timeout=10).json()
+        url = "https://api.bybit.com/v5/market/tickers"
+        r = requests.get(url, params={"category": "linear"}, timeout=10).json()
 
-        if r.get("Response") != "Success":
-            return None
+        dt = round(time.time() - t0, 2)
 
-        df = pd.DataFrame(r["Data"]["Data"])
-        df["t"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        if "result" not in r:
+            return f"❌ BYBIT: bad format {str(r)[:100]}"
 
-        return df[["t", "close", "volumeto"]].rename(
-            columns={"close": "c", "volumeto": "v"}
-        )
+        btc = None
+        for x in r["result"]["list"]:
+            if x["symbol"] == "BTCUSDT":
+                btc = x
+                break
 
-    except:
-        return None
+        if not btc:
+            return "❌ BYBIT: BTCUSDT not found"
 
-# ================= INDICATORS =================
-def ema(s, p):
-    return s.ewm(span=p).mean()
+        return f"""✅ BYBIT OK ({dt}s)
+price: {btc['lastPrice']}
+bid: {btc['bid1Price']}
+ask: {btc['ask1Price']}"""
 
-def rsi(s, p=14):
-    d = s.diff()
-    g = d.clip(lower=0)
-    l = -d.clip(upper=0)
-    rs = g.rolling(p).mean() / l.rolling(p).mean()
-    return 100 - 100 / (1 + rs)
+    except Exception as e:
+        return f"❌ BYBIT ERROR: {e}"
 
-# ================= JANUARY PROFILE =================
-def build_impulse_profile(df):
-    mask = (df["t"] >= "2026-01-13") & (df["t"] <= "2026-01-15 23:59")
-    d = df[mask]
+# ==========================================================
+# 2. BINANCE
+# ==========================================================
+def test_binance():
+    try:
+        t0 = time.time()
 
-    if len(d) < 50:
-        return None
+        url = "https://api.binance.com/api/v3/ticker/price"
+        r = requests.get(url, params={"symbol": "BTCUSDT"}, timeout=10).json()
 
-    start = d["c"].iloc[0]
-    peak = d["c"].max()
-    low = d["c"].min()
+        dt = round(time.time() - t0, 2)
 
-    # UP metrics
-    hour_up = (d["c"].pct_change(4).max()) * 100
-    day_up = (peak / start - 1) * 100
+        if "price" not in r:
+            return f"❌ BINANCE: {str(r)[:100]}"
 
-    # DOWN metrics
-    hour_down = abs((d["c"].pct_change(4).min()) * 100)
-    day_down = abs((low / start - 1) * 100)
+        return f"""✅ BINANCE OK ({dt}s)
+price: {r['price']}"""
 
-    vol_x = d["v"].mean() / df["v"].mean()
+    except Exception as e:
+        return f"❌ BINANCE ERROR: {e}"
 
-    e50 = ema(df["c"], 50)
-    dist = (abs(d["c"] - e50) / d["c"]).mean() * 100
+# ==========================================================
+# 3. CRYPTOCOMPARE
+# ==========================================================
+def test_cryptocompare():
+    try:
+        t0 = time.time()
 
-    return {
-        "up": {"hour": round(hour_up, 2), "day": round(day_up, 2), "ema_dist": round(dist, 2)},
-        "down": {"hour": round(hour_down, 2), "day": round(day_down, 2), "ema_dist": round(dist, 2)},
-        "vol_x": round(vol_x, 2),
-    }
+        url = "https://min-api.cryptocompare.com/data/price"
+        r = requests.get(url, params={"fsym": "BTC", "tsyms": "USDT"}, timeout=10).json()
 
-def current_impulse(df):
-    d = df.tail(20)
+        dt = round(time.time() - t0, 2)
 
-    hour_gain = (d["c"].pct_change(4).max()) * 100
-    hour_drop = abs((d["c"].pct_change(4).min()) * 100)
+        if "USDT" not in r:
+            return f"❌ CRYPTOCOMPARE: {str(r)[:100]}"
 
-    vol_x = d["v"].mean() / df["v"].mean()
-    e50 = ema(df["c"], 50)
-    dist = (abs(d["c"] - e50) / d["c"]).mean() * 100
+        return f"""✅ CRYPTOCOMPARE OK ({dt}s)
+price: {r['USDT']}"""
 
-    return {
-        "hour_gain": round(hour_gain, 2),
-        "hour_drop": round(hour_drop, 2),
-        "vol_x": round(vol_x, 2),
-        "ema_dist": round(dist, 2),
-    }
+    except Exception as e:
+        return f"❌ CRYPTOCOMPARE ERROR: {e}"
 
-def similarity(now, profile):
-    score_up = 0
-    score_down = 0
+# ==========================================================
+# 4. COINGECKO
+# ==========================================================
+def test_coingecko():
+    try:
+        t0 = time.time()
 
-    if now["hour_gain"] >= profile["up"]["hour"] * 0.7:
-        score_up += 1
-    if now["ema_dist"] >= profile["up"]["ema_dist"] * 0.7:
-        score_up += 1
+        url = "https://api.coingecko.com/api/v3/simple/price"
+        r = requests.get(url, params={"ids": "bitcoin", "vs_currencies": "usd"}, timeout=10).json()
 
-    if now["hour_drop"] >= profile["down"]["hour"] * 0.7:
-        score_down += 1
-    if now["ema_dist"] >= profile["down"]["ema_dist"] * 0.7:
-        score_down += 1
+        dt = round(time.time() - t0, 2)
 
-    return score_up / 2, score_down / 2
+        if "bitcoin" not in r:
+            return f"❌ COINGECKO: {str(r)[:100]}"
 
-# ================= STRATEGIES =================
-def check_ema(df, mode):
-    if stats["ema"] >= MAX_EMA:
-        return
+        return f"""✅ COINGECKO OK ({dt}s)
+price: {r['bitcoin']['usd']}"""
 
-    c = df["c"]
-    e50 = ema(c, 50)
-    e200 = ema(c, 200)
-    r = rsi(c)
+    except Exception as e:
+        return f"❌ COINGECKO ERROR: {e}"
 
-    price = c.iloc[-1]
+# ==========================================================
+# MAIN TEST
+# ==========================================================
+def full_test():
+    send("🔎 START MARKET DATA TEST")
 
-    trend_up = price > e50.iloc[-1] and price > e200.iloc[-1]
-    trend_dn = price < e50.iloc[-1] and price < e200.iloc[-1]
+    report = []
 
-    # фильтр по режиму января
-    if mode == "UP" and not trend_up:
-        return
-    if mode == "DOWN" and not trend_dn:
-        return
+    report.append(test_bybit())
+    report.append(test_binance())
+    report.append(test_cryptocompare())
+    report.append(test_coingecko())
 
-    in_zone = 40 < r.iloc[-1] < 60
-    touch = abs(price - e50.iloc[-1]) / price < 0.0025
+    text = "📊 DATA SOURCE CHECK\n\n" + "\n\n".join(report)
 
-    if in_zone and touch:
-        side = "LONG" if trend_up else "SHORT"
+    text += f"\n\nTime: {datetime.now(UTC)}"
 
-        msg = f"""🎯 EMA {side}
+    send(text)
 
-Цена: {price}
-RSI: {round(r.iloc[-1],1)}
-
-Режим рынка: {mode}
-Сегодня EMA: {stats['ema']+1}/{MAX_EMA}"""
-
-        send(msg)
-        stats["ema"] += 1
-
-def check_pump(df, mode):
-    if stats["pump"] >= MAX_PUMP:
-        return
-
-    c = df["c"]
-    v = df["v"]
-
-    growth15 = (c.iloc[-1] - c.iloc[-4]) / c.iloc[-4] * 100
-    vol_x = v.iloc[-1] / (v.mean() + 0.0001)
-
-    if growth15 > 10 and vol_x > 3 and mode == "DOWN":
-        msg = f"""🚨 PUMP SHORT (режим {mode})
-
-Импульс: +{round(growth15,1)}%
-Объём: x{round(vol_x,1)}"""
-
-        send(msg)
-        stats["pump"] += 1
-
-# ================= MAIN =================
-def bot_loop():
-    df = klines()
-    if df is None:
-        send("нет данных для анализа")
-        return
-
-    profile = build_impulse_profile(df)
-    if not profile:
-        send("мало данных за 13–15 янв 2026")
-        return
-
-    now = current_impulse(df)
-    sim_up, sim_down = similarity(now, profile)
-
-    mode = "NEUTRAL"
-    if sim_up > 0.7:
-        mode = "UP"
-    if sim_down > 0.7:
-        mode = "DOWN"
-
-    send(f"Режим рынка: {mode}\nПохожесть UP:{sim_up} DOWN:{sim_down}")
-
-    while True:
-        today = datetime.now(UTC).strftime("%Y-%m-%d")
-        if stats["day"] != today:
-            stats.update({"day": today, "ema": 0, "pump": 0})
-
-        df = klines()
-        if df is not None:
-            check_ema(df, mode)
-            check_pump(df, mode)
-
-        time.sleep(60)
-
-# ================= START =================
+# ==========================================================
+# START
+# ==========================================================
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
-    bot_loop()
+
+    # запускаем тест каждые 5 минут
+    while True:
+        full_test()
+        time.sleep(300)
