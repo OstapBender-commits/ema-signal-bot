@@ -7,9 +7,9 @@ from datetime import datetime, UTC
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+# ================= WEB SERVER FOR RENDER =================
 PORT = int(os.environ.get("PORT", 10000))
 
-# ---------- Мини-веб для Render ----------
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -21,20 +21,17 @@ def run_server():
     print("HTTP server started on port", PORT)
     server.serve_forever()
 
-# ---------- Настройки ----------
+# ================= SETTINGS =================
 TOKEN = os.environ.get("TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-RISK_EMA = 2.5      # 0.5% от 500$
-RISK_PUMP = 1.5     # 0.3%
+RISK_EMA = 2.5      # ~0.5% от 500$
+RISK_PUMP = 1.5     # ~0.3%
 
 MAX_EMA = 3
 MAX_PUMP = 3
 
 REQUEST_DELAY = 1.0
-
-# фильтр ликвидности для всех токенов
-MIN_DAY_VOLUME = 500_000    # $ в сутки
 
 stats = {
     "day": "",
@@ -42,11 +39,10 @@ stats = {
     "pump": 0
 }
 
-# кэш списка пар
 cached_pairs = []
 last_pairs_update = 0
 
-# ---------- Telegram ----------
+# ================= TELEGRAM =================
 def send(msg):
     try:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -54,11 +50,63 @@ def send(msg):
     except Exception as e:
         print("Telegram error:", e)
 
-# ---------- Получение ВСЕХ фьючерсов ----------
+# ================= LIQUIDITY FILTER (STRICT) =================
+def liquidity_ok(pair, size_usd=500):
+    """
+    Строгий фильтр:
+    - V24 >= 1.5m
+    - spread <= 0.10%
+    - 1m liquidity >= 25k$
+    - slippage <= 0.12%
+    """
+    try:
+        t = requests.get(
+            "https://api.bybit.com/v5/market/tickers",
+            params={"category": "linear", "symbol": pair},
+            timeout=10
+        ).json()["result"]["list"][0]
+
+        bid = float(t["bid1Price"])
+        ask = float(t["ask1Price"])
+        vol24 = float(t["turnover24h"])
+
+        # 1. Объём
+        if vol24 < 1_500_000:
+            return False, "volume<1.5m"
+
+        mid = (bid + ask) / 2
+        spread = (ask - bid) / mid
+
+        # 2. Спред
+        if spread > 0.0010:     # 0.10%
+            return False, "spread>0.10%"
+
+        # 3. Минутная ликвидность
+        k1 = klines(pair, "1", 5)
+        if k1 is None:
+            return False, "no_1m_data"
+
+        vol1m_usd = k1["v"].iloc[-1] * mid
+
+        if vol1m_usd < 25_000:
+            return False, "1m_liq<25k"
+
+        # 4. Оценка проскальзывания
+        impact = (size_usd / max(vol1m_usd, 1)) * 0.5
+        slippage_est = spread/2 + impact
+
+        if slippage_est > 0.0012:   # 0.12%
+            return False, "slip>0.12%"
+
+        return True, "ok"
+
+    except Exception as e:
+        return False, "error"
+
+# ================= MARKET DATA =================
 def get_all_futures():
     global cached_pairs, last_pairs_update
 
-    # обновляем список раз в 10 минут
     if time.time() - last_pairs_update < 600 and cached_pairs:
         return cached_pairs
 
@@ -73,12 +121,6 @@ def get_all_futures():
             if not symbol.endswith("USDT"):
                 continue
 
-            vol = float(x.get("turnover24h", 0))
-
-            # фильтр неликвидов
-            if vol < MIN_DAY_VOLUME:
-                continue
-
             pairs.append(symbol)
 
         cached_pairs = pairs
@@ -91,7 +133,6 @@ def get_all_futures():
         print("Pairs error:", e)
         return cached_pairs
 
-# ---------- Свечи ----------
 def klines(pair, interval="15", limit=120):
     url = "https://api.bybit.com/v5/market/kline"
     params = {
@@ -119,7 +160,7 @@ def klines(pair, interval="15", limit=120):
     except:
         return None
 
-# ---------- Индикаторы ----------
+# ================= INDICATORS =================
 def ema(s, p):
     return s.ewm(span=p).mean()
 
@@ -130,9 +171,14 @@ def rsi(s, p=14):
     rs = g.rolling(p).mean() / l.rolling(p).mean()
     return 100 - 100 / (1 + rs)
 
-# ================= EMA ПО ВСЕМ ПАРАМ =================
+# ================= EMA STRATEGY =================
 def check_ema(pair):
     if stats["ema"] >= MAX_EMA:
+        return
+
+    ok, reason = liquidity_ok(pair)
+    if not ok:
+        print(pair, "EMA filtered:", reason)
         return
 
     df = klines(pair)
@@ -172,9 +218,14 @@ RSI: {round(r.iloc[-1],1)}
         send(msg)
         stats["ema"] += 1
 
-# ================= PUMP ПО ВСЕМ ПАРАМ =================
+# ================= PUMP STRATEGY =================
 def check_pump(pair):
     if stats["pump"] >= MAX_PUMP:
+        return
+
+    ok, reason = liquidity_ok(pair)
+    if not ok:
+        print(pair, "PUMP filtered:", reason)
         return
 
     df = klines(pair, "5", 200)
@@ -228,9 +279,9 @@ TP2: {tp2}
     send(msg)
     stats["pump"] += 1
 
-# ================= MAIN =================
+# ================= MAIN LOOP =================
 def bot_loop():
-    send("🟡 BOT STARTED — FULL SCAN MODE")
+    send("🟡 BOT STARTED — STRICT LIQUIDITY MODE")
 
     while True:
         now = datetime.now(UTC)
@@ -250,6 +301,7 @@ def bot_loop():
 
         time.sleep(30)
 
+# ================= START =================
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
     bot_loop()
