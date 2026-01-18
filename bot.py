@@ -25,6 +25,16 @@ def run_server():
 TOKEN = os.environ.get("TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
+RISK_EMA = 2.5
+RISK_PUMP = 1.5
+
+MAX_EMA = 3
+MAX_PUMP = 3
+
+REQUEST_DELAY = 1.0
+
+stats = {"day": "", "ema": 0, "pump": 0}
+
 # ================= TELEGRAM =================
 def send(msg):
     try:
@@ -33,98 +43,29 @@ def send(msg):
     except Exception as e:
         print("Telegram error:", e)
 
-# ==========================================================
-#                MULTI SOURCE KLINES
-# ==========================================================
-def klines(pair="BTCUSDT", interval="15", limit=800):
-    """
-    Источники только аналитические:
-    1) CryptoCompare
-    2) CoinGecko
-    3) Tiingo
-    """
-
-    symbol = pair.replace("USDT", "")
-
-    # ----- 1. CRYPTOCOMPARE -----
+# ================= DATA SOURCE (аналитические) =================
+def klines(limit=2000):
+    """Данные только из нейтрального источника"""
     try:
-        print("Try CryptoCompare...")
-
         url = "https://min-api.cryptocompare.com/data/v2/histominute"
-
-        params = {
-            "fsym": symbol,
-            "tsym": "USDT",
-            "limit": limit,
-            "aggregate": int(interval)
-        }
+        params = {"fsym": "BTC", "tsym": "USDT", "limit": limit, "aggregate": 15}
 
         r = requests.get(url, params=params, timeout=10).json()
 
-        if r.get("Response") == "Success":
-            closes = [x["close"] for x in r["Data"]["Data"]]
-            print("CryptoCompare OK")
-            return pd.DataFrame({"c": closes})
+        if r.get("Response") != "Success":
+            return None
 
-        print("CryptoCompare empty")
+        df = pd.DataFrame(r["Data"]["Data"])
+        df["t"] = pd.to_datetime(df["time"], unit="s", utc=True)
 
-    except Exception as e:
-        print("CryptoCompare fail:", e)
+        return df[["t", "close", "volumeto"]].rename(
+            columns={"close": "c", "volumeto": "v"}
+        )
 
-    # ----- 2. COINGECKO -----
-    try:
-        print("Try CoinGecko...")
+    except:
+        return None
 
-        url = f"https://api.coingecko.com/api/v3/coins/{symbol.lower()}/ohlc"
-
-        params = {
-            "vs_currency": "usd",
-            "days": 7
-        }
-
-        r = requests.get(url, params=params, timeout=10).json()
-
-        if isinstance(r, list) and len(r) > 0:
-            closes = [x[4] for x in r]   # формат [t,o,h,l,c]
-            print("CoinGecko OK")
-            return pd.DataFrame({"c": closes})
-
-        print("CoinGecko empty")
-
-    except Exception as e:
-        print("CoinGecko fail:", e)
-
-    # ----- 3. TIINGO -----
-    try:
-        print("Try Tiingo...")
-
-        url = f"https://api.tiingo.com/tiingo/crypto/prices"
-
-        params = {
-            "tickers": f"{symbol.lower()}usd",
-            "resampleFreq": f"{interval}min",
-            "startDate": "2024-01-01"
-        }
-
-        r = requests.get(url, params=params, timeout=10).json()
-
-        if isinstance(r, list) and r:
-            closes = [x["close"] for x in r[0]["priceData"]]
-            print("Tiingo OK")
-            return pd.DataFrame({"c": closes})
-
-        print("Tiingo empty")
-
-    except Exception as e:
-        print("Tiingo fail:", e)
-
-    print("NO SOURCE AVAILABLE")
-    return None
-
-
-# ==========================================================
-#                INDICATORS
-# ==========================================================
+# ================= INDICATORS =================
 def ema(s, p):
     return s.ewm(span=p).mean()
 
@@ -135,65 +76,163 @@ def rsi(s, p=14):
     rs = g.rolling(p).mean() / l.rolling(p).mean()
     return 100 - 100 / (1 + rs)
 
+# ================= JANUARY PROFILE =================
+def build_impulse_profile(df):
+    mask = (df["t"] >= "2026-01-13") & (df["t"] <= "2026-01-15 23:59")
+    d = df[mask]
 
-# ==========================================================
-#            RESEARCH WITH MULTI ZONES
-# ==========================================================
-def research():
-    print("========== RESEARCH START ==========")
+    if len(d) < 50:
+        return None
 
-    df = klines("BTCUSDT", "15", 800)
+    start = d["c"].iloc[0]
+    peak = d["c"].max()
+    low = d["c"].min()
 
-    if df is None:
-        send("❌ NO DATA FROM ANY SOURCE")
+    # UP metrics
+    hour_up = (d["c"].pct_change(4).max()) * 100
+    day_up = (peak / start - 1) * 100
+
+    # DOWN metrics
+    hour_down = abs((d["c"].pct_change(4).min()) * 100)
+    day_down = abs((low / start - 1) * 100)
+
+    vol_x = d["v"].mean() / df["v"].mean()
+
+    e50 = ema(df["c"], 50)
+    dist = (abs(d["c"] - e50) / d["c"]).mean() * 100
+
+    return {
+        "up": {"hour": round(hour_up, 2), "day": round(day_up, 2), "ema_dist": round(dist, 2)},
+        "down": {"hour": round(hour_down, 2), "day": round(day_down, 2), "ema_dist": round(dist, 2)},
+        "vol_x": round(vol_x, 2),
+    }
+
+def current_impulse(df):
+    d = df.tail(20)
+
+    hour_gain = (d["c"].pct_change(4).max()) * 100
+    hour_drop = abs((d["c"].pct_change(4).min()) * 100)
+
+    vol_x = d["v"].mean() / df["v"].mean()
+    e50 = ema(df["c"], 50)
+    dist = (abs(d["c"] - e50) / d["c"]).mean() * 100
+
+    return {
+        "hour_gain": round(hour_gain, 2),
+        "hour_drop": round(hour_drop, 2),
+        "vol_x": round(vol_x, 2),
+        "ema_dist": round(dist, 2),
+    }
+
+def similarity(now, profile):
+    score_up = 0
+    score_down = 0
+
+    if now["hour_gain"] >= profile["up"]["hour"] * 0.7:
+        score_up += 1
+    if now["ema_dist"] >= profile["up"]["ema_dist"] * 0.7:
+        score_up += 1
+
+    if now["hour_drop"] >= profile["down"]["hour"] * 0.7:
+        score_down += 1
+    if now["ema_dist"] >= profile["down"]["ema_dist"] * 0.7:
+        score_down += 1
+
+    return score_up / 2, score_down / 2
+
+# ================= STRATEGIES =================
+def check_ema(df, mode):
+    if stats["ema"] >= MAX_EMA:
         return
 
     c = df["c"]
     e50 = ema(c, 50)
+    e200 = ema(c, 200)
     r = rsi(c)
 
-    zones = [0.0015, 0.0020, 0.0025, 0.0030]
+    price = c.iloc[-1]
 
-    stats = {z: 0 for z in zones}
-    min_dist = 999
+    trend_up = price > e50.iloc[-1] and price > e200.iloc[-1]
+    trend_dn = price < e50.iloc[-1] and price < e200.iloc[-1]
 
-    for i in range(len(df)):
-        price = c.iloc[i]
+    # фильтр по режиму января
+    if mode == "UP" and not trend_up:
+        return
+    if mode == "DOWN" and not trend_dn:
+        return
 
-        if pd.isna(e50.iloc[i]):
-            continue
+    in_zone = 40 < r.iloc[-1] < 60
+    touch = abs(price - e50.iloc[-1]) / price < 0.0025
 
-        dist = abs(price - e50.iloc[i]) / price
-        min_dist = min(min_dist, dist)
+    if in_zone and touch:
+        side = "LONG" if trend_up else "SHORT"
 
-        if not (40 < r.iloc[i] < 60):
-            continue
+        msg = f"""🎯 EMA {side}
 
-        for z in zones:
-            if dist < z:
-                stats[z] += 1
+Цена: {price}
+RSI: {round(r.iloc[-1],1)}
 
-    text = "📊 TEST BTCUSDT\n\n"
+Режим рынка: {mode}
+Сегодня EMA: {stats['ema']+1}/{MAX_EMA}"""
 
-    for z in zones:
-        text += f"Zone {round(z*100,2)}% → {stats[z]} setups\n"
+        send(msg)
+        stats["ema"] += 1
 
-    text += f"\nMin distance to EMA: {round(min_dist*100,3)}%\n"
+def check_pump(df, mode):
+    if stats["pump"] >= MAX_PUMP:
+        return
 
-    print(text)
-    send(text)
+    c = df["c"]
+    v = df["v"]
 
-    print("========== RESEARCH END ==========")
+    growth15 = (c.iloc[-1] - c.iloc[-4]) / c.iloc[-4] * 100
+    vol_x = v.iloc[-1] / (v.mean() + 0.0001)
 
+    if growth15 > 10 and vol_x > 3 and mode == "DOWN":
+        msg = f"""🚨 PUMP SHORT (режим {mode})
 
-# ==========================================================
-#                        START
-# ==========================================================
+Импульс: +{round(growth15,1)}%
+Объём: x{round(vol_x,1)}"""
+
+        send(msg)
+        stats["pump"] += 1
+
+# ================= MAIN =================
+def bot_loop():
+    df = klines()
+    if df is None:
+        send("нет данных для анализа")
+        return
+
+    profile = build_impulse_profile(df)
+    if not profile:
+        send("мало данных за 13–15 янв 2026")
+        return
+
+    now = current_impulse(df)
+    sim_up, sim_down = similarity(now, profile)
+
+    mode = "NEUTRAL"
+    if sim_up > 0.7:
+        mode = "UP"
+    if sim_down > 0.7:
+        mode = "DOWN"
+
+    send(f"Режим рынка: {mode}\nПохожесть UP:{sim_up} DOWN:{sim_down}")
+
+    while True:
+        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        if stats["day"] != today:
+            stats.update({"day": today, "ema": 0, "pump": 0})
+
+        df = klines()
+        if df is not None:
+            check_ema(df, mode)
+            check_pump(df, mode)
+
+        time.sleep(60)
+
+# ================= START =================
 if __name__ == "__main__":
-    print("BOOT OK")
-
-    research()
-
-    # держим сервис живым, чтобы увидеть логи
     threading.Thread(target=run_server, daemon=True).start()
-    time.sleep(600)
+    bot_loop()
