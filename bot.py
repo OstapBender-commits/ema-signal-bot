@@ -325,8 +325,73 @@ def bot_loop():
 
         time.sleep(30)
 
+# ================= RESEARCH MODE =================
+def research_all_pairs_top10():
+    print("=== RESEARCH MODE: TOP-10 LAST EMA SIGNALS ===")
+
+    pairs = get_all_futures()
+    results = []
+
+    for pair in pairs:
+        ok, reason = liquidity_ok(pair)
+        if not ok:
+            continue
+
+        df = klines(pair, "15", 200)
+        if df is None:
+            continue
+
+        c = df["c"]
+        e50 = ema(c, 50)
+        e200 = ema(c, 200)
+        r = rsi(c)
+
+        for i in range(len(df)):
+            price = c.iloc[i]
+
+            if pd.isna(e50.iloc[i]) or pd.isna(e200.iloc[i]):
+                continue
+
+            trend_up = price > e50.iloc[i] and price > e200.iloc[i]
+            trend_dn = price < e50.iloc[i] and price < e200.iloc[i]
+
+            in_zone = 40 < r.iloc[i] < 60
+            touch = abs(price - e50.iloc[i]) / price < 0.0015
+
+            if in_zone and touch and (trend_up or trend_dn):
+                ts = df.index[i] if "t" not in df else df["t"].iloc[i]
+
+                results.append({
+                    "pair": pair,
+                    "side": "LONG" if trend_up else "SHORT",
+                    "price": float(price),
+                    "rsi": float(r.iloc[i]),
+                    "ema50": float(e50.iloc[i]),
+                    "ema200": float(e200.iloc[i]),
+                    "time": ts
+                })
+
+    # сортируем по времени (новые вверху)
+    results = results[-10:]
+
+    print("\n===== TOP 10 SIGNALS =====\n")
+
+    for s in results:
+        print(
+            s["pair"],
+            s["side"],
+            "price:", round(s["price"], 2),
+            "RSI:", round(s["rsi"], 2),
+            "EMA50:", round(s["ema50"], 2),
+            "EMA200:", round(s["ema200"], 2),
+            "time:", s["time"]
+        )
+
+    print("\n=== END RESEARCH ===")
+
 # ================= START =================
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=self_ping, daemon=True).start()
     bot_loop()
+
