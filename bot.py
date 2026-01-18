@@ -23,14 +23,7 @@ TOKEN = os.environ.get("TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
 MAX_EMA = 3
-
 stats = {"day": "", "ema": 0}
-
-audit = {
-    "ticks": 0,
-    "signals": 0,
-    "rejected": 0
-}
 
 # =============== TELEGRAM ===============
 def send(msg):
@@ -83,9 +76,8 @@ def execution_filter(df):
     vol_ok=v.iloc[-1] > v.mean()*0.8
 
     move=abs(df["c"].pct_change().iloc[-1])
-    price_ok=move < 0.0012   # 0.12%
+    price_ok=move < 0.0012
 
-    # защита от ультра-тихого рынка
     vol_base=base_volatility(df)
     enough_vol=vol_base > 0.0009
 
@@ -113,8 +105,6 @@ def trade_levels(df,side):
 
 # =============== STRATEGY ===============
 def check_ema(df,mode):
-    audit["ticks"]+=1
-
     if stats["ema"]>=MAX_EMA:
         return
 
@@ -134,42 +124,20 @@ def check_ema(df,mode):
     trend_dn=price<e50.iloc[-1] and price<e200.iloc[-1]
     trend=trend_up or trend_dn
 
-    # ---- АУДИТ-БЛОК ----
-    audit_msg=f"""
-🧪 AUDIT SNAPSHOT #{audit['ticks']}
-
-Price: {price}
-EMA50: {round(e50.iloc[-1],2)}
-EMA200: {round(e200.iloc[-1],2)}
-
-Dist: {round(dist*100,3)}%  (th {round(th*100,3)}%)
-RSI: {round(r.iloc[-1],2)}
-
-touch={touch}
-rsi_ok={rsi_ok}
-trend={trend}
-"""
-    send(audit_msg)
-
     if not (touch and rsi_ok and trend):
         return
 
     side="LONG" if trend_up else "SHORT"
 
-    # ---- ФИЛЬТР ИСПОЛНЕНИЯ ----
     if not execution_filter(df):
-        audit["rejected"]+=1
-        send("⛔ REJECT: плохой момент входа (объём/вола/уход)")
         return
 
     stop,tp1,tp2=trade_levels(df,side)
-
     RR=round(abs(tp1-price)/abs(price-stop),2)
 
-    audit["signals"]+=1
     stats["ema"]+=1
 
-    # ---- БОЕВОЙ СИГНАЛ ----
+    # ===== ЕДИНСТВЕННОЕ сообщение, которое ты будешь видеть =====
     send(f"""🎯 EMA {side} — MARKET
 
 Price: {price}
@@ -180,31 +148,16 @@ TP2: {tp2}
 
 RR: 1:{RR}
 
-Audit:
+Проверки:
 dist={round(dist*100,3)}% < {round(th*100,3)}%
 RSI={round(r.iloc[-1],1)}
 trend={'UP' if trend_up else 'DOWN'}
 
 Today: {stats['ema']}/{MAX_EMA}""")
 
-# =============== HOURLY REPORT ===============
-def report():
-    while True:
-        time.sleep(3600)
-
-        send(f"""
-📊 HOURLY REPORT
-
-ticks: {audit['ticks']}
-signals: {audit['signals']}
-rejected: {audit['rejected']}
-""")
-
 # =============== MAIN ===============
 def bot_loop():
-    send("🟢 BOT START — HYBRID MODE")
-
-    threading.Thread(target=report,daemon=True).start()
+    send("🟢 BOT START — QUIET MODE")
 
     warned=False
 
