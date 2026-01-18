@@ -50,15 +50,39 @@ def send(msg):
     except Exception as e:
         print("Telegram error:", e)
 
+# ================= SELF PING (ANTI SLEEP) =================
+PING_URL = "https://ema-signal-bot-mp9f.onrender.com/"
+PING_INTERVAL = 300        # 5 минут
+PING_FAIL_ALERT = 3        # после 3 падений — уведомление
+
+def self_ping():
+    fails = 0
+
+    # ждём 30 сек чтобы бот точно стартовал
+    time.sleep(30)
+
+    while True:
+        try:
+            r = requests.get(PING_URL, timeout=10)
+            if r.status_code == 200:
+                print("self-ping ok")
+                fails = 0
+            else:
+                fails += 1
+                print("self-ping bad status:", r.status_code)
+
+        except Exception as e:
+            fails += 1
+            print("self-ping error:", e)
+
+        if fails >= PING_FAIL_ALERT:
+            send("⚠ SELF-PING PROBLEM: сервис может засыпать!")
+            fails = 0
+
+        time.sleep(PING_INTERVAL)
+
 # ================= LIQUIDITY FILTER (STRICT) =================
 def liquidity_ok(pair, size_usd=500):
-    """
-    Строгий фильтр:
-    - V24 >= 1.5m
-    - spread <= 0.10%
-    - 1m liquidity >= 25k$
-    - slippage <= 0.12%
-    """
     try:
         t = requests.get(
             "https://api.bybit.com/v5/market/tickers",
@@ -281,7 +305,7 @@ TP2: {tp2}
 
 # ================= MAIN LOOP =================
 def bot_loop():
-    send("🟡 BOT STARTED — STRICT LIQUIDITY MODE")
+    send("🟡 BOT STARTED — STRICT LIQ + SELF-PING")
 
     while True:
         now = datetime.now(UTC)
@@ -304,4 +328,5 @@ def bot_loop():
 # ================= START =================
 if __name__ == "__main__":
     threading.Thread(target=run_server, daemon=True).start()
+    threading.Thread(target=self_ping, daemon=True).start()
     bot_loop()
