@@ -391,7 +391,10 @@ def research_all_pairs_top10():
 
 # ================= START =================
 if __name__ == "__main__":
+    # Одноразовый анализ
+    research_all_pairs_top10()
+
+    # чтобы Render не падал
     threading.Thread(target=run_server, daemon=True).start()
-    threading.Thread(target=self_ping, daemon=True).start()
-    bot_loop()
+    time.sleep(900)
 
