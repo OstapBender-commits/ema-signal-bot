@@ -74,25 +74,37 @@ def rsi(s, p=14):
     return 100 - 100 / (1 + rs)
 
 # ================= RESEARCH =================
+
 def research():
     print("========== RESEARCH START ==========")
 
     pairs = ["BTCUSDT"]
     results = []
+    min_dist = 999
 
     for pair in pairs:
         print("Check pair:", pair)
 
-        df = klines(pair, "15", 1000)
+        # 3 попытки получить данные
+        df = None
+        for attempt in range(3):
+            try:
+                df = klines(pair, "15", 500)
+                if df is not None:
+                    break
+            except Exception as e:
+                print("attempt", attempt, "error", e)
+                time.sleep(2)
+
         if df is None:
-            print("no data for", pair)
-            continue
+            msg = "NO DATA FROM BYBIT"
+            print(msg)
+            send(msg)
+            return
 
         c = df["c"]
         e50 = ema(c, 50)
         r = rsi(c)
-
-        min_dist = 999
 
         for i in range(len(df)):
             price = c.iloc[i]
@@ -111,10 +123,8 @@ def research():
                     "pair": pair,
                     "price": float(price),
                     "rsi": float(r.iloc[i]),
-                    "dist": round(dist*100,3)
+                    "dist": round(dist*100, 3)
                 })
-
-        print("MIN DIST TO EMA:", round(min_dist*100,3), "%")
 
     text = f"Found: {len(results)}\nMin dist: {round(min_dist*100,3)}%\n"
 
@@ -126,8 +136,6 @@ def research():
     send(text)
 
     print("========== RESEARCH END ==========")
-
-
 # ================= START =================
 if __name__ == "__main__":
     print("BOOT OK")
