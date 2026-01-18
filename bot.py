@@ -26,6 +26,12 @@ MAX_EMA = 3
 
 stats = {"day": "", "ema": 0}
 
+audit = {
+    "ticks": 0,
+    "signals": 0,
+    "rejected": 0
+}
+
 # =============== TELEGRAM ===============
 def send(msg):
     try:
@@ -34,7 +40,7 @@ def send(msg):
     except:
         pass
 
-# =============== DATA (CryptoCompare) ===============
+# =============== DATA ===============
 def klines(limit=2000):
     try:
         url = "https://min-api.cryptocompare.com/data/v2/histominute"
@@ -58,13 +64,10 @@ def ema(s,p):
     return s.ewm(span=p).mean()
 
 def rsi(s,p=14):
-    d=s.diff()
-    g=d.clip(lower=0)
-    l=-d.clip(upper=0)
+    d=s.diff(); g=d.clip(lower=0); l=-d.clip(upper=0)
     rs=g.rolling(p).mean()/l.rolling(p).mean()
     return 100-100/(1+rs)
 
-# =============== ADAPTIVE THRESHOLD ===============
 def base_volatility(df,look=20):
     return float(df["c"].pct_change().abs().rolling(look).mean().iloc[-1])
 
@@ -74,46 +77,45 @@ def adaptive_threshold(df,mode):
     th=max(0.0015,min(0.0042,vol*k))
     return round(th,5)
 
-# =============== EXECUTION LOGIC ===============
-
+# =============== EXECUTION ===============
 def execution_filter(df):
-    # 1) объём не слишком низкий
-    v = df["v"]
-    vol_ok = v.iloc[-1] > v.mean()*0.8
+    v=df["v"]
+    vol_ok=v.iloc[-1] > v.mean()*0.8
 
-    # 2) цена не убежала от момента сигнала
-    move = abs(df["c"].pct_change().iloc[-1])
-    price_ok = move < 0.0012   # 0.12%
+    move=abs(df["c"].pct_change().iloc[-1])
+    price_ok=move < 0.0012   # 0.12%
 
-    return vol_ok and price_ok
+    # защита от ультра-тихого рынка
+    vol_base=base_volatility(df)
+    enough_vol=vol_base > 0.0009
 
-def trade_levels(df, side):
-    c = df["c"]
+    return vol_ok and price_ok and enough_vol
 
-    # экстремумы последних 5 свечей
-    high = df["c"].rolling(5).max().iloc[-1]
-    low  = df["c"].rolling(5).min().iloc[-1]
+def trade_levels(df,side):
+    c=df["c"]
+    high=df["c"].rolling(5).max().iloc[-1]
+    low=df["c"].rolling(5).min().iloc[-1]
 
-    price = c.iloc[-1]
+    price=c.iloc[-1]
 
-    if side == "LONG":
-        stop = low * 0.999          # -0.1% буфер
-        R = abs(price - stop)
-        tp1 = price + R
-        tp2 = price + R * 1.8
-
+    if side=="LONG":
+        stop=low*0.999
+        R=abs(price-stop)
+        tp1=price+R
+        tp2=price+R*1.8
     else:
-        stop = high * 1.001         # +0.1% буфер
-        R = abs(stop - price)
-        tp1 = price - R
-        tp2 = price - R * 1.8
+        stop=high*1.001
+        R=abs(stop-price)
+        tp1=price-R
+        tp2=price-R*1.8
 
-    return round(stop,2), round(tp1,2), round(tp2,2)
+    return round(stop,2),round(tp1,2),round(tp2,2)
 
 # =============== STRATEGY ===============
-
 def check_ema(df,mode):
-    if stats["ema"] >= MAX_EMA:
+    audit["ticks"]+=1
+
+    if stats["ema"]>=MAX_EMA:
         return
 
     c=df["c"]
@@ -122,54 +124,87 @@ def check_ema(df,mode):
     r=rsi(c)
 
     price=c.iloc[-1]
+    th=adaptive_threshold(df,mode)
+
+    dist=abs(price-e50.iloc[-1])/price
+    touch=dist < th
+    rsi_ok=40<r.iloc[-1]<60
 
     trend_up=price>e50.iloc[-1] and price>e200.iloc[-1]
     trend_dn=price<e50.iloc[-1] and price<e200.iloc[-1]
+    trend=trend_up or trend_dn
 
-    if mode=="UP" and not trend_up: 
-        return
-    if mode=="DOWN" and not trend_dn: 
-        return
+    # ---- АУДИТ-БЛОК ----
+    audit_msg=f"""
+🧪 AUDIT SNAPSHOT #{audit['ticks']}
 
-    th=adaptive_threshold(df,mode)
+Price: {price}
+EMA50: {round(e50.iloc[-1],2)}
+EMA200: {round(e200.iloc[-1],2)}
 
-    touch=abs(price-e50.iloc[-1])/price < th
-    rsi_ok=40<r.iloc[-1]<60
+Dist: {round(dist*100,3)}%  (th {round(th*100,3)}%)
+RSI: {round(r.iloc[-1],2)}
 
-    if not (touch and rsi_ok):
+touch={touch}
+rsi_ok={rsi_ok}
+trend={trend}
+"""
+    send(audit_msg)
+
+    if not (touch and rsi_ok and trend):
         return
 
     side="LONG" if trend_up else "SHORT"
 
-    # ---- защита MARKET входа ----
+    # ---- ФИЛЬТР ИСПОЛНЕНИЯ ----
     if not execution_filter(df):
-        send("⛔ Сетап отклонён: плохой момент входа (объём/уход цены)")
+        audit["rejected"]+=1
+        send("⛔ REJECT: плохой момент входа (объём/вола/уход)")
         return
 
-    stop,tp1,tp2 = trade_levels(df,side)
+    stop,tp1,tp2=trade_levels(df,side)
 
-    RR = round(abs(tp1-price)/abs(price-stop),2)
+    RR=round(abs(tp1-price)/abs(price-stop),2)
 
+    audit["signals"]+=1
+    stats["ema"]+=1
+
+    # ---- БОЕВОЙ СИГНАЛ ----
     send(f"""🎯 EMA {side} — MARKET
 
-Цена входа: {price}
+Price: {price}
 
 STOP: {stop}
 TP1: {tp1}
 TP2: {tp2}
 
-RR: 1 : {RR}
+RR: 1:{RR}
 
-Порог: {round(th*100,3)}%
-RSI: {round(r.iloc[-1],1)}
+Audit:
+dist={round(dist*100,3)}% < {round(th*100,3)}%
+RSI={round(r.iloc[-1],1)}
+trend={'UP' if trend_up else 'DOWN'}
 
-Сегодня: {stats['ema']+1}/{MAX_EMA}""")
+Today: {stats['ema']}/{MAX_EMA}""")
 
-    stats["ema"]+=1
+# =============== HOURLY REPORT ===============
+def report():
+    while True:
+        time.sleep(3600)
+
+        send(f"""
+📊 HOURLY REPORT
+
+ticks: {audit['ticks']}
+signals: {audit['signals']}
+rejected: {audit['rejected']}
+""")
 
 # =============== MAIN ===============
 def bot_loop():
-    send("🟢 BOT START — MARKET VERSION")
+    send("🟢 BOT START — HYBRID MODE")
+
+    threading.Thread(target=report,daemon=True).start()
 
     warned=False
 
@@ -179,9 +214,8 @@ def bot_loop():
             time.sleep(60)
             continue
 
-        # без январского профиля — работаем адаптивно
         if not warned:
-            send("ℹ Профиль янв не найден — работаем адаптивно")
+            send("ℹ профиль не найден — режим NEUTRAL")
             warned=True
 
         mode="NEUTRAL"
@@ -194,7 +228,6 @@ def bot_loop():
 
         time.sleep(60)
 
-# =============== START ===============
 if __name__=="__main__":
     threading.Thread(target=run_server,daemon=True).start()
     bot_loop()
