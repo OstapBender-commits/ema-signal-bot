@@ -6,6 +6,7 @@ from datetime import datetime, UTC
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+# =============== WEB SERVER ===============
 PORT = int(os.environ.get("PORT", 10000))
 
 class Handler(BaseHTTPRequestHandler):
@@ -17,20 +18,15 @@ class Handler(BaseHTTPRequestHandler):
 def run_server():
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
+# =============== SETTINGS ===============
 TOKEN = os.environ.get("TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-# ===== AUDIT STORAGE =====
-audit = {
-    "ticks": 0,
-    "touch_true": 0,
-    "rsi_true": 0,
-    "trend_true": 0,
-    "signals_sent": 0,
-    "rejected_by_mode": 0,
-}
+MAX_EMA = 3
 
-# ===== TELEGRAM =====
+stats = {"day": "", "ema": 0}
+
+# =============== TELEGRAM ===============
 def send(msg):
     try:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -38,7 +34,7 @@ def send(msg):
     except:
         pass
 
-# ===== DATA =====
+# =============== DATA (CryptoCompare) ===============
 def klines(limit=2000):
     try:
         url = "https://min-api.cryptocompare.com/data/v2/histominute"
@@ -57,14 +53,18 @@ def klines(limit=2000):
     except:
         return None
 
-# ===== INDICATORS =====
-def ema(s,p): return s.ewm(span=p).mean()
+# =============== INDICATORS ===============
+def ema(s,p): 
+    return s.ewm(span=p).mean()
 
 def rsi(s,p=14):
-    d=s.diff(); g=d.clip(lower=0); l=-d.clip(upper=0)
+    d=s.diff()
+    g=d.clip(lower=0)
+    l=-d.clip(upper=0)
     rs=g.rolling(p).mean()/l.rolling(p).mean()
     return 100-100/(1+rs)
 
+# =============== ADAPTIVE THRESHOLD ===============
 def base_volatility(df,look=20):
     return float(df["c"].pct_change().abs().rolling(look).mean().iloc[-1])
 
@@ -74,126 +74,102 @@ def adaptive_threshold(df,mode):
     th=max(0.0015,min(0.0042,vol*k))
     return round(th,5)
 
-# ===== PROFILE =====
-def build_profile(df):
-    mask=(df["t"]>="2026-01-13 17:30")&(df["t"]<="2026-01-14 02:00")
-    d=df[mask]
-    if len(d)<20: return None
+# =============== EXECUTION LOGIC ===============
 
-    return {
-        "up":{"hour":(d["c"].pct_change(4).max())*100},
-        "down":{"hour":abs((d["c"].pct_change(4).min())*100)}
-    }
+def execution_filter(df):
+    # 1) объём не слишком низкий
+    v = df["v"]
+    vol_ok = v.iloc[-1] > v.mean()*0.8
 
-def current_impulse(df):
-    d=df.tail(20)
-    return {
-        "hour_gain":(d["c"].pct_change(4).max())*100,
-        "hour_drop":abs((d["c"].pct_change(4).min())*100)
-    }
+    # 2) цена не убежала от момента сигнала
+    move = abs(df["c"].pct_change().iloc[-1])
+    price_ok = move < 0.0012   # 0.12%
 
-def similarity(now,profile):
-    su=sd=0
-    if now["hour_gain"]>=profile["up"]["hour"]*0.7: su+=1
-    if now["hour_drop"]>=profile["down"]["hour"]*0.7: sd+=1
-    return su,sd
+    return vol_ok and price_ok
 
-# ===== AUDIT SNAPSHOT =====
-def debug_snapshot(df,mode,th,checks):
-    msg=f"""
-🧪 SNAPSHOT #{audit['ticks']}
+def trade_levels(df, side):
+    c = df["c"]
 
-Prices: {df['c'].tail(3).tolist()}
+    # экстремумы последних 5 свечей
+    high = df["c"].rolling(5).max().iloc[-1]
+    low  = df["c"].rolling(5).min().iloc[-1]
 
-Vol base: {round(base_volatility(df),6)}
-Threshold: {th}
+    price = c.iloc[-1]
 
-RSI: {round(rsi(df['c']).iloc[-1],2)}
-EMA50: {round(ema(df['c'],50).iloc[-1],2)}
-EMA200: {round(ema(df['c'],200).iloc[-1],2)}
+    if side == "LONG":
+        stop = low * 0.999          # -0.1% буфер
+        R = abs(price - stop)
+        tp1 = price + R
+        tp2 = price + R * 1.8
 
-Mode: {mode}
+    else:
+        stop = high * 1.001         # +0.1% буфер
+        R = abs(stop - price)
+        tp1 = price - R
+        tp2 = price - R * 1.8
 
-Conditions:
-touch={checks['touch']}
-rsi={checks['rsi']}
-trend={checks['trend']}
-"""
-    send(msg)
+    return round(stop,2), round(tp1,2), round(tp2,2)
 
-# ===== STRATEGY WITH AUDIT =====
+# =============== STRATEGY ===============
+
 def check_ema(df,mode):
-    audit["ticks"]+=1
+    if stats["ema"] >= MAX_EMA:
+        return
 
     c=df["c"]
-    e50=ema(c,50); e200=ema(c,200); r=rsi(c)
+    e50=ema(c,50)
+    e200=ema(c,200)
+    r=rsi(c)
 
     price=c.iloc[-1]
+
+    trend_up=price>e50.iloc[-1] and price>e200.iloc[-1]
+    trend_dn=price<e50.iloc[-1] and price<e200.iloc[-1]
+
+    if mode=="UP" and not trend_up: 
+        return
+    if mode=="DOWN" and not trend_dn: 
+        return
+
     th=adaptive_threshold(df,mode)
 
     touch=abs(price-e50.iloc[-1])/price < th
     rsi_ok=40<r.iloc[-1]<60
 
-    trend_up=price>e50.iloc[-1] and price>e200.iloc[-1]
-    trend_dn=price<e50.iloc[-1] and price<e200.iloc[-1]
-    trend=trend_up or trend_dn
-
-    # --- audit counters ---
-    if touch: audit["touch_true"]+=1
-    if rsi_ok: audit["rsi_true"]+=1
-    if trend: audit["trend_true"]+=1
-
-    checks={"touch":touch,"rsi":rsi_ok,"trend":trend}
-
-    debug_snapshot(df,mode,th,checks)
-
-    # --- decision ---
-    if not (touch and rsi_ok and trend):
+    if not (touch and rsi_ok):
         return
 
     side="LONG" if trend_up else "SHORT"
 
-    # filter by mode
-    if mode=="UP" and side!="LONG":
-        audit["rejected_by_mode"]+=1
+    # ---- защита MARKET входа ----
+    if not execution_filter(df):
+        send("⛔ Сетап отклонён: плохой момент входа (объём/уход цены)")
         return
 
-    if mode=="DOWN" and side!="SHORT":
-        audit["rejected_by_mode"]+=1
-        return
+    stop,tp1,tp2 = trade_levels(df,side)
 
-    audit["signals_sent"]+=1
+    RR = round(abs(tp1-price)/abs(price-stop),2)
 
-    send(f"""🎯 SIGNAL {side}
+    send(f"""🎯 EMA {side} — MARKET
 
-price: {price}
-threshold: {th}
-mode: {mode}""")
+Цена входа: {price}
 
-# ===== HOURLY AUDIT REPORT =====
-def audit_report():
-    while True:
-        time.sleep(3600)
+STOP: {stop}
+TP1: {tp1}
+TP2: {tp2}
 
-        msg=f"""
-📊 AUDIT REPORT
+RR: 1 : {RR}
 
-ticks: {audit['ticks']}
+Порог: {round(th*100,3)}%
+RSI: {round(r.iloc[-1],1)}
 
-touch true: {audit['touch_true']}
-rsi true: {audit['rsi_true']}
-trend true: {audit['trend_true']}
+Сегодня: {stats['ema']+1}/{MAX_EMA}""")
 
-signals sent: {audit['signals_sent']}
-rejected by mode: {audit['rejected_by_mode']}
-"""
-        send(msg)
+    stats["ema"]+=1
 
-# ===== MAIN =====
+# =============== MAIN ===============
 def bot_loop():
-    send("🟢 BOT START — AUDIT MODE")
-
-    threading.Thread(target=audit_report,daemon=True).start()
+    send("🟢 BOT START — MARKET VERSION")
 
     warned=False
 
@@ -203,22 +179,22 @@ def bot_loop():
             time.sleep(60)
             continue
 
-        profile=build_profile(df)
+        # без январского профиля — работаем адаптивно
+        if not warned:
+            send("ℹ Профиль янв не найден — работаем адаптивно")
+            warned=True
 
-        if not profile:
-            if not warned:
-                send("ℹ профиль не найден — режим NEUTRAL")
-                warned=True
-            mode="NEUTRAL"
-        else:
-            now=current_impulse(df)
-            su,sd=similarity(now,profile)
-            mode="UP" if su>sd else "DOWN" if sd>su else "NEUTRAL"
+        mode="NEUTRAL"
+
+        today=datetime.now(UTC).strftime("%Y-%m-%d")
+        if stats["day"]!=today:
+            stats.update({"day":today,"ema":0})
 
         check_ema(df,mode)
 
         time.sleep(60)
 
+# =============== START ===============
 if __name__=="__main__":
     threading.Thread(target=run_server,daemon=True).start()
     bot_loop()
