@@ -5,12 +5,11 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, UTC
 import threading
-
-# --- маленький веб-сервер ---
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 PORT = int(os.environ.get("PORT", 10000))
 
+# ---------- Мини-веб для Render ----------
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -22,13 +21,11 @@ def run_server():
     print("HTTP server started on port", PORT)
     server.serve_forever()
 
-# --- настройки ---
+# ---------- Настройки ----------
 TOKEN = os.environ.get("TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-EMA_PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-
-RISK_EMA = 2.5      # 0.5%
+RISK_EMA = 2.5      # 0.5% от 500$
 RISK_PUMP = 1.5     # 0.3%
 
 MAX_EMA = 3
@@ -36,12 +33,18 @@ MAX_PUMP = 3
 
 REQUEST_DELAY = 1.0
 
+# фильтр ликвидности для всех токенов
+MIN_DAY_VOLUME = 500_000    # $ в сутки
+
 stats = {
     "day": "",
     "ema": 0,
-    "pump": 0,
-    "log": []
+    "pump": 0
 }
+
+# кэш списка пар
+cached_pairs = []
+last_pairs_update = 0
 
 # ---------- Telegram ----------
 def send(msg):
@@ -51,15 +54,44 @@ def send(msg):
     except Exception as e:
         print("Telegram error:", e)
 
-# ---------- BYBIT ----------
+# ---------- Получение ВСЕХ фьючерсов ----------
 def get_all_futures():
+    global cached_pairs, last_pairs_update
+
+    # обновляем список раз в 10 минут
+    if time.time() - last_pairs_update < 600 and cached_pairs:
+        return cached_pairs
+
     try:
         url = "https://api.bybit.com/v5/market/tickers?category=linear"
         r = requests.get(url, timeout=10).json()
-        return [x["symbol"] for x in r["result"]["list"] if x["symbol"].endswith("USDT")]
-    except:
-        return []
 
+        pairs = []
+        for x in r["result"]["list"]:
+            symbol = x["symbol"]
+
+            if not symbol.endswith("USDT"):
+                continue
+
+            vol = float(x.get("turnover24h", 0))
+
+            # фильтр неликвидов
+            if vol < MIN_DAY_VOLUME:
+                continue
+
+            pairs.append(symbol)
+
+        cached_pairs = pairs
+        last_pairs_update = time.time()
+
+        print("Pairs loaded:", len(pairs))
+        return pairs
+
+    except Exception as e:
+        print("Pairs error:", e)
+        return cached_pairs
+
+# ---------- Свечи ----------
 def klines(pair, interval="15", limit=120):
     url = "https://api.bybit.com/v5/market/kline"
     params = {
@@ -87,7 +119,7 @@ def klines(pair, interval="15", limit=120):
     except:
         return None
 
-# ---------- индикаторы ----------
+# ---------- Индикаторы ----------
 def ema(s, p):
     return s.ewm(span=p).mean()
 
@@ -98,7 +130,7 @@ def rsi(s, p=14):
     rs = g.rolling(p).mean() / l.rolling(p).mean()
     return 100 - 100 / (1 + rs)
 
-# ---------- EMA ----------
+# ================= EMA ПО ВСЕМ ПАРАМ =================
 def check_ema(pair):
     if stats["ema"] >= MAX_EMA:
         return
@@ -128,6 +160,7 @@ def check_ema(pair):
         pos = round(RISK_EMA / 0.006, 1)
 
         msg = f"""{'🟢' if side=='LONG' else '🔴'} EMA {pair} {side}
+
 Цена: {price}
 RSI: {round(r.iloc[-1],1)}
 
@@ -139,7 +172,7 @@ RSI: {round(r.iloc[-1],1)}
         send(msg)
         stats["ema"] += 1
 
-# ---------- PUMP ----------
+# ================= PUMP ПО ВСЕМ ПАРАМ =================
 def check_pump(pair):
     if stats["pump"] >= MAX_PUMP:
         return
@@ -185,7 +218,6 @@ def check_pump(pair):
 Вход: {last}
 Стоп: {stop}
 
-Тейки:
 TP1: {tp1}
 TP2: {tp2}
 
@@ -196,9 +228,9 @@ TP2: {tp2}
     send(msg)
     stats["pump"] += 1
 
-# ---------- MAIN LOGIC ----------
+# ================= MAIN =================
 def bot_loop():
-    send("🟡 BOT STARTED (WEB MODE)")
+    send("🟡 BOT STARTED — FULL SCAN MODE")
 
     while True:
         now = datetime.now(UTC)
@@ -209,22 +241,15 @@ def bot_loop():
             stats["ema"] = 0
             stats["pump"] = 0
 
-        # EMA
-        for p in EMA_PAIRS:
-            check_ema(p)
-            time.sleep(REQUEST_DELAY)
+        pairs = get_all_futures()
 
-        # PUMPS
-        for p in get_all_futures():
+        for p in pairs:
+            check_ema(p)
             check_pump(p)
             time.sleep(REQUEST_DELAY)
 
         time.sleep(30)
 
-# ---------- START ----------
 if __name__ == "__main__":
-    # веб-сервер в отдельном потоке
     threading.Thread(target=run_server, daemon=True).start()
-
-    # основная логика
     bot_loop()
