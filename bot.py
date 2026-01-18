@@ -77,21 +77,22 @@ def rsi(s, p=14):
 def research():
     print("========== RESEARCH START ==========")
 
-    pairs = ["BTCUSDT"]   # начнём только с BTC для гарантии
+    pairs = ["BTCUSDT"]
     results = []
 
     for pair in pairs:
         print("Check pair:", pair)
 
-        df = klines(pair, "15", 200)
+        df = klines(pair, "15", 1000)
         if df is None:
             print("no data for", pair)
             continue
 
         c = df["c"]
         e50 = ema(c, 50)
-        e200 = ema(c, 200)
         r = rsi(c)
+
+        min_dist = 999
 
         for i in range(len(df)):
             price = c.iloc[i]
@@ -99,26 +100,29 @@ def research():
             if pd.isna(e50.iloc[i]):
                 continue
 
+            dist = abs(price - e50.iloc[i]) / price
+            min_dist = min(min_dist, dist)
+
             in_zone = 40 < r.iloc[i] < 60
-            touch = abs(price - e50.iloc[i]) / price < 0.0015
+            touch = dist < 0.0015
 
             if in_zone and touch:
                 results.append({
                     "pair": pair,
                     "price": float(price),
                     "rsi": float(r.iloc[i]),
-                    "ema50": float(e50.iloc[i])
+                    "dist": round(dist*100,3)
                 })
 
-    print("FOUND:", len(results))
+        print("MIN DIST TO EMA:", round(min_dist*100,3), "%")
 
-    text = "RESULTS:\n"
+    text = f"Found: {len(results)}\nMin dist: {round(min_dist*100,3)}%\n"
 
     for s in results[-5:]:
-        line = f"{s['pair']} price={round(s['price'],2)} RSI={round(s['rsi'],1)}"
-        print(line)
+        line = f"{s['pair']} price={s['price']} RSI={s['rsi']} dist={s['dist']}%"
         text += line + "\n"
 
+    print(text)
     send(text)
 
     print("========== RESEARCH END ==========")
