@@ -9,9 +9,9 @@ TOKEN = os.environ.get("TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
 PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-RISK = 2.5            # 0.5% от 500$
+RISK = 2.5
 MAX_PER_DAY = 3
-REQUEST_DELAY = 1.2   # защита от rate limit Binance
+REQUEST_DELAY = 1.2
 
 stats = {
     "day": "",
@@ -27,27 +27,34 @@ def send(msg):
     except Exception as e:
         print("Telegram send error:", e)
 
-# ---------- Binance ----------
+# ---------- Bybit candles ----------
 def klines(pair):
-    url = "https://api.binance.com/api/v3/klines"
-    params = {"symbol": pair, "interval": "15m", "limit": 120}
+    # Bybit требует формат BTCUSDT -> BTCUSDT (ок, совпадает)
+    url = "https://api.bybit.com/v5/market/kline"
+
+    params = {
+        "category": "linear",
+        "symbol": pair,
+        "interval": "15",
+        "limit": 120
+    }
 
     try:
         r = requests.get(url, params=params, timeout=10).json()
 
-        # Если Binance вернул не список свечей
-        if not isinstance(r, list):
-            print("Binance error:", r)
+        if r.get("retCode") != 0:
+            print("Bybit error:", r)
             time.sleep(5)
             return None
 
-        df = pd.DataFrame(r)
-        if df.empty:
-            return None
+        rows = r["result"]["list"]
 
-        df = df.iloc[:, 0:6]
-        df.columns = ["t", "o", "h", "l", "c", "v"]
-        df["c"] = df["c"].astype(float)
+        # Bybit отдаёт в обратном порядке → разворачиваем
+        rows = rows[::-1]
+
+        closes = [float(x[4]) for x in rows]
+
+        df = pd.DataFrame({"c": closes})
 
         return df
 
@@ -93,14 +100,13 @@ def daily_report():
     return text
 
 # ---------- СТАРТ ----------
-send("🟡 EMA Signal Bot STARTED")
+send("🟡 EMA Signal Bot STARTED (Bybit data)")
 
 # ---------- ОСНОВНОЙ ЦИКЛ ----------
 while True:
     now = datetime.utcnow()
     today = now.strftime("%Y-%m-%d")
 
-    # Новый день → сброс
     if stats["day"] != today:
         if stats["day"] != "":
             send(daily_report())
