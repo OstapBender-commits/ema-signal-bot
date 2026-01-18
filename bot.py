@@ -33,39 +33,98 @@ def send(msg):
     except Exception as e:
         print("Telegram error:", e)
 
-# ================= BASIC FUNCTIONS =================
-def klines(pair, interval="15", limit=200):
-    print("load klines:", pair, interval)
+# ==========================================================
+#                MULTI SOURCE KLINES
+# ==========================================================
+def klines(pair="BTCUSDT", interval="15", limit=800):
+    """
+    Источники только аналитические:
+    1) CryptoCompare
+    2) CoinGecko
+    3) Tiingo
+    """
 
-    url = "https://api.bybit.com/v5/market/kline"
-    params = {
-        "category": "linear",
-        "symbol": pair,
-        "interval": interval,
-        "limit": limit
-    }
+    symbol = pair.replace("USDT", "")
 
+    # ----- 1. CRYPTOCOMPARE -----
     try:
-        r = requests.get(url, params=params, timeout=10)
-        print("HTTP status:", r.status_code)
+        print("Try CryptoCompare...")
 
-        data = r.json()
-        print("Bybit answer:", str(data)[:200])
+        url = "https://min-api.cryptocompare.com/data/v2/histominute"
 
-        if data.get("retCode") != 0:
-            print("kline error", data)
-            return None
+        params = {
+            "fsym": symbol,
+            "tsym": "USDT",
+            "limit": limit,
+            "aggregate": int(interval)
+        }
 
-        rows = data["result"]["list"][::-1]
+        r = requests.get(url, params=params, timeout=10).json()
 
-        closes = [float(x[4]) for x in rows]
+        if r.get("Response") == "Success":
+            closes = [x["close"] for x in r["Data"]["Data"]]
+            print("CryptoCompare OK")
+            return pd.DataFrame({"c": closes})
 
-        return pd.DataFrame({"c": closes})
+        print("CryptoCompare empty")
 
     except Exception as e:
-        print("kline exception", e)
-        return None
+        print("CryptoCompare fail:", e)
 
+    # ----- 2. COINGECKO -----
+    try:
+        print("Try CoinGecko...")
+
+        url = f"https://api.coingecko.com/api/v3/coins/{symbol.lower()}/ohlc"
+
+        params = {
+            "vs_currency": "usd",
+            "days": 7
+        }
+
+        r = requests.get(url, params=params, timeout=10).json()
+
+        if isinstance(r, list) and len(r) > 0:
+            closes = [x[4] for x in r]   # формат [t,o,h,l,c]
+            print("CoinGecko OK")
+            return pd.DataFrame({"c": closes})
+
+        print("CoinGecko empty")
+
+    except Exception as e:
+        print("CoinGecko fail:", e)
+
+    # ----- 3. TIINGO -----
+    try:
+        print("Try Tiingo...")
+
+        url = f"https://api.tiingo.com/tiingo/crypto/prices"
+
+        params = {
+            "tickers": f"{symbol.lower()}usd",
+            "resampleFreq": f"{interval}min",
+            "startDate": "2024-01-01"
+        }
+
+        r = requests.get(url, params=params, timeout=10).json()
+
+        if isinstance(r, list) and r:
+            closes = [x["close"] for x in r[0]["priceData"]]
+            print("Tiingo OK")
+            return pd.DataFrame({"c": closes})
+
+        print("Tiingo empty")
+
+    except Exception as e:
+        print("Tiingo fail:", e)
+
+    print("NO SOURCE AVAILABLE")
+    return None
+
+
+# ==========================================================
+#                INDICATORS
+# ==========================================================
 def ema(s, p):
     return s.ewm(span=p).mean()
 
@@ -76,75 +135,65 @@ def rsi(s, p=14):
     rs = g.rolling(p).mean() / l.rolling(p).mean()
     return 100 - 100 / (1 + rs)
 
-# ================= RESEARCH =================
 
+# ==========================================================
+#            RESEARCH WITH MULTI ZONES
+# ==========================================================
 def research():
     print("========== RESEARCH START ==========")
 
-    pairs = ["BTCUSDT"]
-    results = []
+    df = klines("BTCUSDT", "15", 800)
+
+    if df is None:
+        send("❌ NO DATA FROM ANY SOURCE")
+        return
+
+    c = df["c"]
+    e50 = ema(c, 50)
+    r = rsi(c)
+
+    zones = [0.0015, 0.0020, 0.0025, 0.0030]
+
+    stats = {z: 0 for z in zones}
     min_dist = 999
 
-    for pair in pairs:
-        print("Check pair:", pair)
+    for i in range(len(df)):
+        price = c.iloc[i]
 
-        # 3 попытки получить данные
-        df = None
-        for attempt in range(3):
-            try:
-                df = klines(pair, "15", 500)
-                if df is not None:
-                    break
-            except Exception as e:
-                print("attempt", attempt, "error", e)
-                time.sleep(2)
+        if pd.isna(e50.iloc[i]):
+            continue
 
-        if df is None:
-            msg = "NO DATA FROM BYBIT"
-            print(msg)
-            send(msg)
-            return
+        dist = abs(price - e50.iloc[i]) / price
+        min_dist = min(min_dist, dist)
 
-        c = df["c"]
-        e50 = ema(c, 50)
-        r = rsi(c)
+        if not (40 < r.iloc[i] < 60):
+            continue
 
-        for i in range(len(df)):
-            price = c.iloc[i]
+        for z in zones:
+            if dist < z:
+                stats[z] += 1
 
-            if pd.isna(e50.iloc[i]):
-                continue
+    text = "📊 TEST BTCUSDT\n\n"
 
-            dist = abs(price - e50.iloc[i]) / price
-            min_dist = min(min_dist, dist)
+    for z in zones:
+        text += f"Zone {round(z*100,2)}% → {stats[z]} setups\n"
 
-            in_zone = 40 < r.iloc[i] < 60
-            touch = dist < 0.0015
-
-            if in_zone and touch:
-                results.append({
-                    "pair": pair,
-                    "price": float(price),
-                    "rsi": float(r.iloc[i]),
-                    "dist": round(dist*100, 3)
-                })
-
-    text = f"Found: {len(results)}\nMin dist: {round(min_dist*100,3)}%\n"
-
-    for s in results[-5:]:
-        line = f"{s['pair']} price={s['price']} RSI={s['rsi']} dist={s['dist']}%"
-        text += line + "\n"
+    text += f"\nMin distance to EMA: {round(min_dist*100,3)}%\n"
 
     print(text)
     send(text)
 
     print("========== RESEARCH END ==========")
-# ================= START =================
+
+
+# ==========================================================
+#                        START
+# ==========================================================
 if __name__ == "__main__":
     print("BOOT OK")
 
     research()
 
-    # держим сервис живым
+    # держим сервис живым, чтобы увидеть логи
     threading.Thread(target=run_server, daemon=True).start()
     time.sleep(600)
