@@ -116,67 +116,69 @@ def coin_metrics(df):
 # ==========================================================
 
 def detect_pattern(df):
-    """
-    Логика из анализа:
-    - 3 бара роста
-    - объём выше среднего
-    - нет больших верхних теней (у нас OHLC нет → косвенно через импульс)
-    """
-
     if len(df) < 6:
         return None
 
     c = df["c"]
     v = df["v"]
 
-    # последние 3 15-минутки
-    g1 = (c.iloc[-3] < c.iloc[-2])
-    g2 = (c.iloc[-2] < c.iloc[-1])
+    # ===== ПАРАМЕТРЫ ИЗ КАЛИБРОВКИ =====
+    MIN_GROWTH = 0.25      # %
+    MIN_VOLX   = 1.5
 
     growth = (c.iloc[-1] - c.iloc[-3]) / c.iloc[-3] * 100
+    vol_mult = v.iloc[-1] / (v.iloc[-20:].mean() + 1e-9)
 
-    vol_mult = v.iloc[-1] / (v.mean() + 1e-9)
+    trend = (c.iloc[-3] < c.iloc[-2] < c.iloc[-1])
 
-    # ===== КОЭФФИЦИЕНТ ПОХОЖЕСТИ 0-100 =====
+    # --- коэффициент похожести ---
     score = 0
 
-    if g1: score += 25
-    if g2: score += 25
+    if trend:
+        score += 40
 
-    # рост
-    if growth >= 0.25: score += 25
-    if growth >= 0.40: score += 10
+    if growth >= MIN_GROWTH:
+        score += 30
+    if growth >= MIN_GROWTH * 1.6:
+        score += 10
 
-    # объём
-    if vol_mult >= 1.5: score += 25
-    if vol_mult >= 2.0: score += 10
+    if vol_mult >= MIN_VOLX:
+        score += 30
+    if vol_mult >= MIN_VOLX * 1.4:
+        score += 10
 
     signal = None
 
-    # ===== LONG =====
+    # ===== LONG (наиболее валидно по тесту) =====
     if score >= 70:
         signal = {
             "type": "LONG",
             "score": score,
-            "growth": round(growth,2),
-            "vol_x": round(vol_mult,2)
+            "growth": round(growth, 2),
+            "vol_x": round(vol_mult, 2),
+
+            # цели из реальной статистики BTC
+            "tp1": 0.35,
+            "tp2": 0.60,
+            "sl": -0.22
         }
 
-    # ===== ВОЗМОЖНЫЙ SHORT ПОСЛЕ ПЕРЕГРЕВА =====
-    # если был сильный памп и объём падает
+    # ===== SHORT ПО ПЕРЕГРЕВУ =====
     g60 = (c.iloc[-1] - c.iloc[-5]) / c.iloc[-5] * 100
 
     if g60 > 1.0 and vol_mult < 0.8:
         signal = {
             "type": "SHORT",
             "score": score,
-            "growth": round(g60,2),
-            "vol_x": round(vol_mult,2)
+            "growth": round(g60, 2),
+            "vol_x": round(vol_mult, 2),
+
+            "tp": -0.6,
+            "sl": 0.25
         }
 
     return signal
-
-
+    
 # ===== ПРОВЕРКА И АЛЕРТЫ =====
 def scan_signals():
     while True:
