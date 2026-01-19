@@ -1,241 +1,307 @@
-import asyncio
+import requests
+import time
 import os
-import asyncio
-import statistics
-from collections import deque, defaultdict
-from datetime import datetime
+import pandas as pd
+import numpy as np
+from datetime import datetime, UTC
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from binance import AsyncClient, BinanceSocketManager
-from telegram import Bot
+PORT = int(os.environ.get("PORT", 10000))
 
-# ===== БЕРЁМ ИЗ ENV RENDER =====
+# ===== KEEP ALIVE =====
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+def run_server():
+    HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+
+
+# ===== НАСТРОЙКИ =====
 TOKEN = os.environ.get("TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
 
-if not TOKEN or not CHAT_ID:
-    raise Exception(
-        "Не заданы переменные окружения TOKEN или CHAT_ID в Render!"
-    )
-
-bot = Bot(TOKEN)
-
-# ===== HTTP ДЛЯ RENDER =====
-from fastapi import FastAPI
-import uvicorn
-
-app = FastAPI()
-
-@app.get("/")
-async def root():
-    return {"status": "alive", "time": str(datetime.utcnow())}
-
-
-# ===== НАСТРОЙКИ ТОРГОВЛИ =====
 SYMBOLS = [
-    "BTCUSDT","ETHUSDT","SOLUSDT",
-    "BNBUSDT","XRPUSDT","DOGEUSDT"
+    "BTC","ETH","BNB","SOL","XRP",
+    "ADA","DOGE","AVAX","LINK","DOT"
 ]
 
-NEWCOMERS = set()
-
-PARAMS = {
-    "min_growth": 0.25,
-    "volume_mult": 1.8,
-    "max_upper_shadow": 0.3,
-    "min_similarity": 70
+# память сигналов, чтобы не спамить
+LAST_ALERT = {}
+STATS = {
+    "signals": 0,
+    "long": 0,
+    "short": 0
 }
 
-# ===== ХРАНИЛИЩА =====
-trades = defaultdict(lambda: deque(maxlen=2000))
-candles = defaultdict(lambda: deque(maxlen=200))
-stats = defaultdict(list)
+# ===== ОТПРАВКА В TG =====
+def send(msg):
+    try:
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        requests.post(url, data={
+            "chat_id": CHAT_ID,
+            "text": msg
+        }, timeout=10)
+    except:
+        pass
 
-bot = Bot(TOKEN)
 
-# ===== УТИЛИТЫ =====
-def pct(a, b):
-    return (b - a) / a * 100
+# ===== ЗАГРУЗКА ДАННЫХ =====
+def klines(symbol, limit=2000):
+    try:
+        url = "https://min-api.cryptocompare.com/data/v2/histominute"
+
+        # 15-минутные бары как у тебя
+        p = {
+            "fsym": symbol,
+            "tsym": "USDT",
+            "limit": limit,
+            "aggregate": 15
+        }
+
+        r = requests.get(url, params=p, timeout=10).json()
+
+        if r.get("Response") != "Success":
+            return None
+
+        df = pd.DataFrame(r["Data"]["Data"])
+        df["t"] = pd.to_datetime(df["time"], unit="s", utc=True)
+
+        return df[["t","close","volumeto"]].rename(
+            columns={"close":"c","volumeto":"v"}
+        )
+    except:
+        return None
 
 
-def build_candle(ticks):
-    o = ticks[0]["p"]
-    c = ticks[-1]["p"]
-    h = max(t["p"] for t in ticks)
-    l = min(t["p"] for t in ticks)
-    vol = sum(t["q"] for t in ticks)
+# ===== МЕТРИКИ (твой код) =====
+def coin_metrics(df):
+    c = df["c"]
+    v = df["v"]
 
-    body = abs(c - o)
-    upper = h - max(o, c)
+    g15 = c.pct_change(4) * 100
+    g60 = c.pct_change(13) * 100
+
+    peak = c.cummax()
+    draw = (peak - c) / peak * 100
+
+    d = c.diff()
+    g = d.clip(lower=0)
+    l = -d.clip(upper=0)
+    rs = g.rolling(14).mean() / l.rolling(14).mean()
+    rsi = 100 - 100/(1+rs)
 
     return {
-        "open": o,
-        "high": h,
-        "low": l,
-        "close": c,
-        "vol": vol,
-        "upper_shadow": upper / (body + 1e-9)
+        "g15_mean": round(g15.mean(),2),
+        "g15_p90": round(np.percentile(g15.dropna(),90),2),
+
+        "g60_mean": round(g60.mean(),2),
+        "g60_p90": round(np.percentile(g60.dropna(),90),2),
+
+        "max_pump": round(g60.max(),2),
+
+        "vol_x": round((v.iloc[-1]/(v.mean()+1e-9)),2),
+
+        "typical_dd": round(draw.mean(),2),
+
+        "rsi_peak": round(rsi.tail(50).max(),1)
     }
 
 
-# ===== ПОХОЖЕСТЬ НА ПАТТЕРН =====
-def similarity(symbol):
-    cs = list(candles[symbol])[-3:]
-    if len(cs) < 3:
-        return 0
+# ==========================================================
+# =============== НАШ ПАТТЕРН ИЗ ИССЛЕДОВАНИЯ ==============
+# ==========================================================
 
-    shape = sum(1 for c in cs if c["close"] > c["open"]) * 10
+def detect_pattern(df):
+    """
+    Логика из анализа:
+    - 3 бара роста
+    - объём выше среднего
+    - нет больших верхних теней (у нас OHLC нет → косвенно через импульс)
+    """
 
-    avg = statistics.mean(c["vol"] for c in list(candles[symbol])[-30:])
-    vol_score = min(30, int(cs[-1]["vol"] / avg * 15))
+    if len(df) < 6:
+        return None
 
-    shadow = sum(
-        1 for c in cs if c["upper_shadow"] < PARAMS["max_upper_shadow"]
-    ) * 10
+    c = df["c"]
+    v = df["v"]
 
-    growth = pct(cs[0]["open"], cs[-1]["close"])
-    growth_score = min(
-        30, int(growth / PARAMS["min_growth"] * 15)
-    )
+    # последние 3 15-минутки
+    g1 = (c.iloc[-3] < c.iloc[-2])
+    g2 = (c.iloc[-2] < c.iloc[-1])
 
-    return shape + vol_score + shadow + growth_score
+    growth = (c.iloc[-1] - c.iloc[-3]) / c.iloc[-3] * 100
 
+    vol_mult = v.iloc[-1] / (v.mean() + 1e-9)
 
-# ===== ПЕРЕГРЕВ ДЛЯ ШОРТА =====
-def overheat(symbol):
-    cs = list(candles[symbol])[-10:]
-    if len(cs) < 10:
-        return False
+    # ===== КОЭФФИЦИЕНТ ПОХОЖЕСТИ 0-100 =====
+    score = 0
 
-    growth = pct(cs[0]["open"], cs[-1]["close"])
-    if growth < 1:
-        return False
+    if g1: score += 25
+    if g2: score += 25
 
-    vols = [c["vol"] for c in cs]
-    return vols[-1] < statistics.mean(vols)
+    # рост
+    if growth >= 0.25: score += 25
+    if growth >= 0.40: score += 10
 
+    # объём
+    if vol_mult >= 1.5: score += 25
+    if vol_mult >= 2.0: score += 10
 
-# ===== АЛЕРТЫ =====
-async def alert_long(symbol, sim, candle):
-    msg = f"""
-🟢 LONG {symbol}
+    signal = None
 
-Похожесть: {sim}%
-Рост: {pct(candle['open'], candle['close']):.2f}%
-Объём: {candle['vol']:.2f}
+    # ===== LONG =====
+    if score >= 70:
+        signal = {
+            "type": "LONG",
+            "score": score,
+            "growth": round(growth,2),
+            "vol_x": round(vol_mult,2)
+        }
 
-SL: −0.22%
-TP1: +0.35%
-TP2: +0.60%
-"""
-    await bot.send_message(CHAT_ID, msg)
+    # ===== ВОЗМОЖНЫЙ SHORT ПОСЛЕ ПЕРЕГРЕВА =====
+    # если был сильный памп и объём падает
+    g60 = (c.iloc[-1] - c.iloc[-5]) / c.iloc[-5] * 100
 
+    if g60 > 1.0 and vol_mult < 0.8:
+        signal = {
+            "type": "SHORT",
+            "score": score,
+            "growth": round(g60,2),
+            "vol_x": round(vol_mult,2)
+        }
 
-async def alert_short(symbol, candle):
-    msg = f"""
-🔴 SHORT IDEA {symbol}
-
-Перегрев после пампа
-Цена: {candle['close']}
-
-SL: +0.25%
-TP: −0.4…−0.8%
-"""
-    await bot.send_message(CHAT_ID, msg)
-
-
-# ===== СОКЕТ ТРЕЙДОВ =====
-async def trade_socket(symbol, bm):
-    ts = bm.trade_socket(symbol)
-
-    async with ts as tscm:
-        while True:
-            res = await tscm.recv()
-
-            trades[symbol].append({
-                "p": float(res["p"]),
-                "q": float(res["q"]),
-                "T": res["T"]
-            })
-
-            if len(trades[symbol]) > 20:
-                candle = build_candle(list(trades[symbol]))
-                candles[symbol].append(candle)
-
-                sim = similarity(symbol)
-
-                if sim >= PARAMS["min_similarity"]:
-                    await alert_long(symbol, sim, candle)
-
-                if overheat(symbol):
-                    await alert_short(symbol, candle)
+    return signal
 
 
-# ===== ПОИСК НОВЫХ МОНЕТ =====
-async def scan_newcomers(client):
-    try:
-        tickers = await client.get_ticker()
-        for t in tickers:
-            s = t["symbol"]
-            if not s.endswith("USDT"):
+# ===== ПРОВЕРКА И АЛЕРТЫ =====
+def scan_signals():
+    while True:
+
+        for s in SYMBOLS:
+            df = klines(s, 300)
+
+            if df is None:
                 continue
 
-            change = float(t["priceChangePercent"])
+            sig = detect_pattern(df)
 
-            if change > 20 and s not in SYMBOLS:
-                SYMBOLS.append(s)
-                NEWCOMERS.add(s)
+            if not sig:
+                continue
 
-                await bot.send_message(
-                    CHAT_ID,
-                    f"🆕 Новый горячий токен: {s} +{change}%"
-                )
-    except Exception as e:
-        print("scan error", e)
+            # антиспам — не чаще раза в 60 мин на монету
+            last = LAST_ALERT.get(s, 0)
+            if time.time() - last < 3600:
+                continue
+
+            LAST_ALERT[s] = time.time()
+            STATS["signals"] += 1
+
+            if sig["type"] == "LONG":
+                STATS["long"] += 1
+
+                msg = f"""
+🟢 LONG SETUP {s}/USDT
+
+Похожесть: {sig['score']}%
+Рост: {sig['growth']}%
+Объём x: {sig['vol_x']}
+
+Идея:
+SL −0.22%
+TP1 +0.35%
+TP2 +0.60%
+"""
+
+            else:
+                STATS["short"] += 1
+
+                msg = f"""
+🔴 RISK OF DUMP {s}/USDT
+
+Перегрев: +{sig['growth']}%
+Объём x: {sig['vol_x']}
+
+Идея:
+SHORT на сломе
+SL +0.25%
+TP −0.4…−0.8%
+"""
+
+            send(msg)
+
+        time.sleep(60 * 5)   # каждые 5 минут
 
 
-# ===== KEEP ALIVE ДЛЯ RENDER =====
-async def keep_alive():
+# ===== ТВОЙ ОТЧЁТ 5H (оставлен) =====
+def stats_report():
     while True:
-        try:
-            await bot.send_chat_action(
-                CHAT_ID, action="typing"
-            )
-        except:
-            pass
+        text = "📊 5H MARKET REPORT\n\n"
 
-        await asyncio.sleep(300)   # 5 минут
+        for s in SYMBOLS:
+            df = klines(s)
 
+            if df is None:
+                text += f"❌ {s}: no data\n\n"
+                continue
 
-# ===== ГЛАВНЫЙ ЦИКЛ =====
-async def trading_loop():
-    client = await AsyncClient.create()
-    bm = BinanceSocketManager(client)
+            bars = len(df)
+            first = df["t"].iloc[0]
+            last  = df["t"].iloc[-1]
 
-    for s in SYMBOLS:
-        asyncio.create_task(
-            trade_socket(s.lower(), bm)
-        )
+            days = round((last - first).total_seconds() / 86400, 1)
 
-    while True:
-        await scan_newcomers(client)
-        await asyncio.sleep(600)
+            m = coin_metrics(df)
+
+            text += f"""🔹 {s}/USDT
+
+bars: {bars}
+coverage: ~{days} days
+
+15m avg: {m['g15_mean']}%
+15m p90: {m['g15_p90']}%
+
+1h avg: {m['g60_mean']}%
+1h p90: {m['g60_p90']}%
+
+max 1h: {m['max_pump']}%
+vol x: {m['vol_x']}
+
+RSI peak: {m['rsi_peak']}
+
+"""
+
+            time.sleep(1.2)
+
+        # добавим статистику сигналов
+        text += f"""
+
+Signals: {STATS['signals']}
+Long: {STATS['long']}
+Short: {STATS['short']}
+
+Time: {datetime.now(UTC)}
+"""
+
+        send(text)
+
+        time.sleep(5 * 3600)
 
 
 # ===== ЗАПУСК =====
-async def main():
-    asyncio.create_task(trading_loop())
-    asyncio.create_task(keep_alive())
+def bot_loop():
+    send("🟢 BOT START — PATTERN + DEPTH")
 
-    # веб для Render
-    config = uvicorn.Config(
-        app,
-        host="0.0.0.0",
-        port=10000,
-        log_level="info"
-    )
-    server = uvicorn.Server(config)
-    await server.serve()
+    threading.Thread(target=stats_report, daemon=True).start()
+    threading.Thread(target=scan_signals, daemon=True).start()
+
+    while True:
+        time.sleep(60)
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__=="__main__":
+    threading.Thread(target=run_server,daemon=True).start()
+    bot_loop()
