@@ -26,7 +26,6 @@ SYMBOLS = [
     "ADA","DOGE","AVAX","LINK","DOT"
 ]
 
-# ===== TELEGRAM =====
 def send(msg):
     try:
         url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -34,7 +33,7 @@ def send(msg):
     except:
         pass
 
-# ===== DATA =====
+
 def klines(symbol, limit=2000):
     try:
         url = "https://min-api.cryptocompare.com/data/v2/histominute"
@@ -53,20 +52,17 @@ def klines(symbol, limit=2000):
     except:
         return None
 
-# ===== METRICS =====
+
 def coin_metrics(df):
     c = df["c"]
     v = df["v"]
 
-    # импульсы
     g15 = c.pct_change(4) * 100
     g60 = c.pct_change(13) * 100
 
-    # откаты после локальных пиков
     peak = c.cummax()
     draw = (peak - c) / peak * 100
 
-    # RSI
     d = c.diff()
     g = d.clip(lower=0)
     l = -d.clip(upper=0)
@@ -89,7 +85,7 @@ def coin_metrics(df):
         "rsi_peak": round(rsi.tail(50).max(),1)
     }
 
-# ===== 5-HOUR REPORT =====
+
 def stats_report():
     while True:
         text = "📊 5H MARKET REPORT\n\n"
@@ -101,13 +97,11 @@ def stats_report():
                 text += f"❌ {s}: no data\n\n"
                 continue
 
-            # ===== НОВЫЙ БЛОК ГЛУБИНЫ =====
             bars = len(df)
             first = df["t"].iloc[0]
             last  = df["t"].iloc[-1]
 
             days = round((last - first).total_seconds() / 86400, 1)
-            # ==============================
 
             m = coin_metrics(df)
 
@@ -140,62 +134,16 @@ RSI peak: {m['rsi_peak']}
 
         time.sleep(5 * 3600)
 
-# ===== MAIN =====
+
 def bot_loop():
-    send("🟢 BOT START — STAT MODE")
+    send("🟢 BOT START — DEPTH MONITOR")
 
     threading.Thread(target=stats_report, daemon=True).start()
 
     while True:
         time.sleep(60)
 
+
 if __name__=="__main__":
     threading.Thread(target=run_server,daemon=True).start()
-    def range_check():
-    PERIOD_START = "2026-01-13 00:00:00"
-    PERIOD_END   = "2026-01-15 23:59:59"
-
-    report = "🔎 RANGE CHECK 13–15 Jan 2026\n\n"
-
-    for symbol in SYMBOLS:
-        df = klines(symbol)
-
-        if df is None:
-            report += f"❌ {symbol}: API вернул None\n\n"
-            continue
-
-        first = df["t"].iloc[0]
-        last  = df["t"].iloc[-1]
-
-        part = df[
-            (df["t"] >= PERIOD_START) &
-            (df["t"] <= PERIOD_END)
-        ]
-
-        report += f"""🔹 {symbol}/USDT
-Всего баров: {len(df)}
-Диапазон в ответе:
-  from: {first}
-  to:   {last}
-
-В периоде 13–15 янв:
-  bars: {len(part)}
-
-"""
-
-        # если есть данные — покажем 3 первые цены
-        if len(part) > 0:
-            sample = part["c"].head(3).tolist()
-            report += f"sample prices: {sample}\n\n"
-
-        time.sleep(1.5)
-
-    send(report)
-
-
-# ===== ЗАПУСК ТЕСТА =====
-if __name__ == "__main__":
-    threading.Thread(target=run_server, daemon=True).start()
-
-    send("🧪 START RANGE TEST")
-    range_check()
+    bot_loop()
