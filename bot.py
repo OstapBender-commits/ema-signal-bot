@@ -134,4 +134,51 @@ def bot_loop():
 
 if __name__=="__main__":
     threading.Thread(target=run_server,daemon=True).start()
-    bot_loop()
+    def range_check():
+    PERIOD_START = "2026-01-13 00:00:00"
+    PERIOD_END   = "2026-01-15 23:59:59"
+
+    report = "🔎 RANGE CHECK 13–15 Jan 2026\n\n"
+
+    for symbol in SYMBOLS:
+        df = klines(symbol)
+
+        if df is None:
+            report += f"❌ {symbol}: API вернул None\n\n"
+            continue
+
+        first = df["t"].iloc[0]
+        last  = df["t"].iloc[-1]
+
+        part = df[
+            (df["t"] >= PERIOD_START) &
+            (df["t"] <= PERIOD_END)
+        ]
+
+        report += f"""🔹 {symbol}/USDT
+Всего баров: {len(df)}
+Диапазон в ответе:
+  from: {first}
+  to:   {last}
+
+В периоде 13–15 янв:
+  bars: {len(part)}
+
+"""
+
+        # если есть данные — покажем 3 первые цены
+        if len(part) > 0:
+            sample = part["c"].head(3).tolist()
+            report += f"sample prices: {sample}\n\n"
+
+        time.sleep(1.5)
+
+    send(report)
+
+
+# ===== ЗАПУСК ТЕСТА =====
+if __name__ == "__main__":
+    threading.Thread(target=run_server, daemon=True).start()
+
+    send("🧪 START RANGE TEST")
+    range_check()
