@@ -1,4 +1,6 @@
 import asyncio
+import os
+import asyncio
 import statistics
 from collections import deque, defaultdict
 from datetime import datetime
@@ -6,9 +8,16 @@ from datetime import datetime
 from binance import AsyncClient, BinanceSocketManager
 from telegram import Bot
 
-# ===== ТВОИ КОНСТАНТЫ ИЗ ПРОЕКТА =====
-from config import TOKEN, CHAT_ID
+# ===== БЕРЁМ ИЗ ENV RENDER =====
+TOKEN = os.environ.get("TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
 
+if not TOKEN or not CHAT_ID:
+    raise Exception(
+        "Не заданы переменные окружения TOKEN или CHAT_ID в Render!"
+    )
+
+bot = Bot(TOKEN)
 
 # ===== HTTP ДЛЯ RENDER =====
 from fastapi import FastAPI
