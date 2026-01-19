@@ -96,13 +96,29 @@ def stats_report():
 
         for s in SYMBOLS:
             df = klines(s)
+
             if df is None:
-                text += f"{s}: no data\n\n"
+                text += f"❌ {s}: no data\n\n"
                 continue
+
+            # ===== НОВЫЙ БЛОК ГЛУБИНЫ =====
+            bars = len(df)
+            first = df["t"].iloc[0]
+            last  = df["t"].iloc[-1]
+
+            days = round((last - first).total_seconds() / 86400, 1)
+            # ==============================
 
             m = coin_metrics(df)
 
             text += f"""🔹 {s}/USDT
+
+🕐 DEPTH INFO
+bars: {bars}
+from: {first}
+to:   {last}
+coverage: ~{days} days
+
 15m avg: {m['g15_mean']}%
 15m p90: {m['g15_p90']}%
 
@@ -117,10 +133,11 @@ RSI peak: {m['rsi_peak']}
 
 """
 
+            time.sleep(1.2)
+
         text += f"Time: {datetime.now(UTC)}"
         send(text)
 
-        # ---- каждые 5 часов ----
         time.sleep(5 * 3600)
 
 # ===== MAIN =====
