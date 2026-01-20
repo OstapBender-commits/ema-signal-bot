@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: reagents-bot
+    runtime: python
+    rootDir: .github
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: Login
+        sync: false
+      - key: Password
+        sync: false
+      - key: TELEGRAM_TOKEN
+        sync: false
