@@ -1,110 +1,88 @@
-import requests, time, os
-import pandas as pd
-import numpy as np
+import os
+import requests
+from bs4 import BeautifulSoup
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+from flask import Flask
+import threading
 
-TOKEN = os.environ.get("TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
+# ===== Переменные из Render =====
+LOGIN = os.getenv("Login")
+PASSWORD = os.getenv("Password")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-PAIRS = ["BTCUSDT","ETHUSDT","SOLUSDT"]
-RISK = 2.5
+HOST = "http://194.67.82.80/SEDA/en_GB/"
 
-def send(msg):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+# ===== Имитация веб-сервера для Render =====
+app = Flask(__name__)
 
-def klines(pair):
-    url = "https://api.binance.com/api/v3/klines"
-    p = {"symbol": pair, "interval":"15m", "limit":120}
-    r = requests.get(url, params=p).json()
+@app.route("/")
+def home():
+    return "Bot is running"
 
-    df = pd.DataFrame(r)
-    df = df.iloc[:,0:6]
-    df.columns = ["t","o","h","l","c","v"]
-    df["c"] = df["c"].astype(float)
-    return df
+def run_web():
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 
-def ema(s, p):
-    return s.ewm(span=p).mean()
+# ===== Функция логина в 1С =====
+def login_1c(session: requests.Session):
+    data = {
+        "username": LOGIN,
+        "password": PASSWORD
+    }
 
-def rsi(s, p=14):
-    d = s.diff()
-    g = d.clip(lower=0)
-    l = -d.clip(upper=0)
-    rs = g.rolling(p).mean()/l.rolling(p).mean()
-    return 100 - 100/(1+rs)
+    r = session.post(HOST + "login", data=data)
+    return r.status_code == 200
 
-send("🟡 EMA Signal Bot STARTED")
 
-sent = {}
-day_count = 0
-last_day = ""
+# ===== Получение остатков реагентов =====
+def get_reagents():
+    session = requests.Session()
 
-while True:
-    now_day = time.strftime("%Y-%m-%d")
+    if not login_1c(session):
+        return "❌ Ошибка входа в 1С"
 
-    if now_day != last_day:
-        day_count = 0
-        last_day = now_day
+    r = session.get(HOST + "reagents_stock")
+    soup = BeautifulSoup(r.text, "html.parser")
 
-    for p in PAIRS:
-        if day_count >= 3:
-            continue
+    table = soup.find("table")
 
-        df = klines(p)
-        c = df["c"]
+    result = "🧪 *Остатки реагентов:*\n\n"
 
-        e50 = ema(c,50)
-        e200 = ema(c,200)
-        r = rsi(c)
+    if not table:
+        return "Не удалось найти таблицу остатков"
 
-        price = c.iloc[-1]
+    for row in table.find_all("tr")[1:]:
+        cols = [c.text.strip() for c in row.find_all("td")]
+        if len(cols) >= 2:
+            result += f"• {cols[0]} — {cols[1]}\n"
 
-        trend_up = price > e50.iloc[-1] and price > e200.iloc[-1]
-        trend_dn = price < e50.iloc[-1] and price < e200.iloc[-1]
+    return result
 
-        in_zone = 40 < r.iloc[-1] < 60
-        touch = abs(price - e50.iloc[-1])/price < 0.0015
 
-        key = p + now_day
+# ===== Команды Telegram =====
 
-        if in_zone and touch and key not in sent:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет! Я бот остатков реагентов.\n"
+        "Используй /stock для выгрузки."
+    )
 
-            pos = round(RISK/0.006,1)
 
-            if trend_up:
-                msg = f"""🟢 {p} LONG
-Цена: {price}
-RSI: {round(r.iloc[-1],1)}
+async def stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = get_reagents()
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
-Риск: {RISK}$
-Позиция: {pos}$
 
-Проверь:
-• выше EMA50/200
-• откат к EMA50
-• зелёная свеча
+def main():
+    threading.Thread(target=run_web).start()
 
-Не более 3 сделок в день"""
-                send(msg)
-                sent[key]=1
-                day_count+=1
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-            elif trend_dn:
-                msg = f"""🔴 {p} SHORT
-Цена: {price}
-RSI: {round(r.iloc[-1],1)}
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stock", stock))
 
-Риск: {RISK}$
-Позиция: {pos}$
+    application.run_polling()
 
-Проверь:
-• ниже EMA50/200
-• откат к EMA50
-• красная свеча
 
-Не более 3 сделок в день"""
-                send(msg)
-                sent[key]=1
-                day_count+=1
-
-    time.sleep(30)
+if __name__ == "__main__":
+    main()
